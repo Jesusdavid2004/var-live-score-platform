@@ -99,6 +99,50 @@ services:
     networks:
       - var-network
 
+  match_state_service:
+    build:
+      context: ./services/match_state_service
+    container_name: match_state_service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - var-network
+
+  betting_suspension_service:
+    build:
+      context: ./services/betting_suspension_service
+    container_name: betting_suspension_service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - var-network
+
+  betting_worker:
+    build:
+      context: ./services/betting_worker
+    container_name: betting_worker
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - var-network
+
 networks:
   var-network:
     driver: bridge
