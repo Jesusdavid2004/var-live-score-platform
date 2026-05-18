@@ -1,0 +1,15 @@
+{
+  "name": "persona3-rabbitmq-ui",
+  "version": "1.0.0",
+  "description": "VAR Platform - Capa RabbitMQ y Presentacion (Persona 3)",
+  "scripts": {
+    "dashboard": "node dashboard_backend/index.js",
+    "notifications": "node notification_backend/index.js",
+    "setup-exchanges": "node dashboard_backend/setup-exchanges.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "express": "^4.18.2",
+    "ws": "^8.16.0"
+  }
+}
