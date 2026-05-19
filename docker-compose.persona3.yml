@@ -1,0 +1,66 @@
+# ============================================================
+#  docker-compose.persona3.yml
+#  Fragmento de Persona 3 — para que P1 (Jesus) integre
+#  en el docker-compose.yml principal.
+#
+#  P1: pega estos tres servicios en el archivo principal
+#      junto a los de P2. El network y rabbitmq ya estan
+#      declarados por ti.
+# ============================================================
+
+services:
+
+  # ── Dashboard Backend (WebSocket + HTTP) ──────────────────
+  dashboard_backend:
+    build:
+      context: ./persona3-rabbitmq-ui
+      dockerfile: Dockerfile.dashboard
+    container_name: dashboard_backend
+    ports:
+      - "3003:3003"
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - DASHBOARD_PORT=3003
+    depends_on:
+      rabbitmq:
+        condition: service_healthy   # espera healthcheck de RabbitMQ
+    networks:
+      - var_network
+    restart: on-failure
+
+  # ── Notification Backend (consola de alertas) ─────────────
+  notification_backend:
+    build:
+      context: ./persona3-rabbitmq-ui
+      dockerfile: Dockerfile.notification
+    container_name: notification_backend
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - var_network
+    restart: on-failure
+
+# ── Nota para P1 ─────────────────────────────────────────────
+# El servicio rabbitmq con healthcheck nativo debe estar
+# definido en el compose principal con esta configuracion:
+#
+#   rabbitmq:
+#     image: rabbitmq:3-management
+#     ports:
+#       - "5672:5672"
+#       - "15672:15672"     # panel de gestion
+#     healthcheck:
+#       test: ["CMD", "rabbitmq-diagnostics", "ping"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+#     networks:
+#       - var_network
+#
+# Y la red compartida:
+#   networks:
+#     var_network:
+#       driver: bridge

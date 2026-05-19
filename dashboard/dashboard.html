@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VAR Live Score Platform</title>
+  <style>
+    /* ── Reset y base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0a0e1a;
+      color: #e8eaf6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+    }
+
+    /* ── Header ───────────────────────────────────────────── */
+    header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    header h1 {
+      font-size: 1.4rem;
+      font-weight: 700;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      color: #7986cb;
+    }
+    header p {
+      font-size: 0.78rem;
+      color: #546e7a;
+      margin-top: 4px;
+      letter-spacing: 1px;
+    }
+
+    /* ── Tarjeta principal del partido ───────────────────── */
+    .match-card {
+      background: #131929;
+      border: 1px solid #1e2a45;
+      border-radius: 16px;
+      padding: 40px 48px;
+      width: 100%;
+      max-width: 560px;
+      text-align: center;
+      position: relative;
+      transition: border-color 0.4s;
+    }
+    .match-card.var-active {
+      border-color: #f57c00;
+      box-shadow: 0 0 24px rgba(245, 124, 0, 0.25);
+    }
+
+    /* ── Nombres de equipos ───────────────────────────────── */
+    .teams {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 8px;
+    }
+    .team-name {
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: #90a4ae;
+      flex: 1;
+    }
+    .team-name.home { text-align: left; }
+    .team-name.away { text-align: right; }
+    .vs { font-size: 0.75rem; color: #37474f; font-weight: 700; }
+
+    /* ── Marcador ─────────────────────────────────────────── */
+    .scoreboard {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 24px;
+      margin: 16px 0 24px;
+    }
+    .score {
+      font-size: 5rem;
+      font-weight: 900;
+      line-height: 1;
+      color: #e8eaf6;
+      transition: transform 0.2s, color 0.3s;
+      min-width: 72px;
+    }
+    .score.bump {
+      transform: scale(1.25);
+      color: #42a5f5;
+    }
+    .score.bump-down {
+      transform: scale(1.15);
+      color: #ef5350;
+    }
+    .score-divider {
+      font-size: 3.5rem;
+      font-weight: 100;
+      color: #263238;
+    }
+
+    /* ── Banner VAR ───────────────────────────────────────── */
+    .var-banner {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      background: linear-gradient(90deg, #e65100, #f57c00);
+      border-radius: 8px;
+      padding: 10px 20px;
+      margin-bottom: 20px;
+      animation: pulse 1.2s infinite;
+    }
+    .var-banner.visible { display: flex; }
+    .var-banner span { font-size: 0.9rem; font-weight: 700; letter-spacing: 2px; color: #fff; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.7; }
+    }
+
+    /* ── Ultimo evento ────────────────────────────────────── */
+    .last-event {
+      font-size: 0.82rem;
+      color: #546e7a;
+      min-height: 20px;
+      transition: color 0.3s;
+    }
+    .last-event.goal   { color: #42a5f5; }
+    .last-event.annul  { color: #ef5350; }
+    .last-event.var    { color: #f57c00; }
+
+    /* ── Log de eventos ───────────────────────────────────── */
+    .event-log {
+      width: 100%;
+      max-width: 560px;
+      margin-top: 24px;
+    }
+    .event-log h2 {
+      font-size: 0.7rem;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: #37474f;
+      margin-bottom: 10px;
+      padding-left: 4px;
+    }
+    .log-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .log-list li {
+      background: #131929;
+      border: 1px solid #1e2a45;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 0.8rem;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .log-list .log-time { color: #37474f; font-family: monospace; font-size: 0.72rem; }
+    .log-list .log-icon { font-size: 1rem; }
+    .log-list .log-text { color: #90a4ae; }
+
+    /* ── Indicador de conexion ───────────────────────────── */
+    .conn-status {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.72rem;
+      color: #546e7a;
+      background: #131929;
+      border: 1px solid #1e2a45;
+      border-radius: 20px;
+      padding: 6px 12px;
+    }
+    .conn-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #37474f;
+      transition: background 0.3s;
+    }
+    .conn-dot.connected    { background: #66bb6a; box-shadow: 0 0 6px #66bb6a88; }
+    .conn-dot.disconnected { background: #ef5350; }
+    .conn-dot.connecting   { background: #f57c00; animation: pulse 1s infinite; }
+  </style>
+</head>
+<body>
+
+  <!-- Indicador de conexion WebSocket -->
+  <div class="conn-status">
+    <div class="conn-dot connecting" id="connDot"></div>
+    <span id="connLabel">Conectando...</span>
+  </div>
+
+  <header>
+    <h1>📺 VAR Live Score</h1>
+    <p>Sistemas Distribuidos · Arquitectura Kafka + RabbitMQ</p>
+  </header>
+
+  <!-- Tarjeta del partido -->
+  <div class="match-card" id="matchCard">
+
+    <!-- Banner VAR (visible solo durante VAR_CHECK) -->
+    <div class="var-banner" id="varBanner">
+      <span>📺 VAR EN REVISIÓN</span>
+    </div>
+
+    <!-- Nombres de equipos -->
+    <div class="teams">
+      <div class="team-name home">Local</div>
+      <div class="vs">VS</div>
+      <div class="team-name away">Visitante</div>
+    </div>
+
+    <!-- Marcador principal -->
+    <div class="scoreboard">
+      <div class="score" id="scoreHome">-</div>
+      <div class="score-divider">:</div>
+      <div class="score" id="scoreAway">-</div>
+    </div>
+
+    <!-- Ultimo evento recibido -->
+    <div class="last-event" id="lastEvent">Esperando inicio del partido...</div>
+
+  </div>
+
+  <!-- Log de eventos en tiempo real -->
+  <div class="event-log">
+    <h2>⚡ Eventos en tiempo real</h2>
+    <ul class="log-list" id="logList"></ul>
+  </div>
+
+  <script>
+    // ── Config ────────────────────────────────────────────────────────────────
+    const WS_URL = `ws://${window.location.host}`;
+
+    // ── Referencias DOM ───────────────────────────────────────────────────────
+    const scoreHome = document.getElementById('scoreHome');
+    const scoreAway = document.getElementById('scoreAway');
+    const lastEvent = document.getElementById('lastEvent');
+    const varBanner = document.getElementById('varBanner');
+    const matchCard = document.getElementById('matchCard');
+    const logList   = document.getElementById('logList');
+    const connDot   = document.getElementById('connDot');
+    const connLabel = document.getElementById('connLabel');
+
+    // ── Estado local ──────────────────────────────────────────────────────────
+    let ws;
+    let varActivo = false;
+
+    // ── Iconos por tipo de evento ─────────────────────────────────────────────
+    const ICONOS = {
+      KICKOFF:       '🏁',
+      GOAL:          '⚽',
+      VAR_CHECK:     '📺',
+      GOAL_ANNULLED: '❌',
+      MATCH_CONTINUES: '✅',
+      MATCH_END:     '🏆',
+      default:       '🔔',
+    };
+
+    // ── Actualiza el marcador con animacion ───────────────────────────────────
+    function actualizarMarcador(home, away, tipo) {
+      const animClass = tipo === 'GOAL_ANNULLED' ? 'bump-down' : 'bump';
+
+      scoreHome.textContent = home;
+      scoreAway.textContent = away;
+
+      // Animacion de "bump" al cambiar marcador
+      scoreHome.classList.add(animClass);
+      scoreAway.classList.add(animClass);
+      setTimeout(() => {
+        scoreHome.classList.remove('bump', 'bump-down');
+        scoreAway.classList.remove('bump', 'bump-down');
+      }, 400);
+    }
+
+    // ── Actualiza el banner VAR ───────────────────────────────────────────────
+    function actualizarVAR(tipo) {
+      if (tipo === 'VAR_CHECK') {
+        varActivo = true;
+        varBanner.classList.add('visible');
+        matchCard.classList.add('var-active');
+      } else if (['GOAL_ANNULLED', 'MATCH_CONTINUES', 'GOAL'].includes(tipo)) {
+        varActivo = false;
+        varBanner.classList.remove('visible');
+        matchCard.classList.remove('var-active');
+      }
+    }
+
+    // ── Agrega una fila al log de eventos ─────────────────────────────────────
+    function agregarLog(datos) {
+      const tipo  = datos.event_type || 'INFO';
+      const icono = ICONOS[tipo] || ICONOS.default;
+      const hora  = new Date().toLocaleTimeString('es-CO', { hour12: false });
+
+      const texto = {
+        KICKOFF:         `Partido iniciado`,
+        GOAL:            `¡GOL del equipo ${datos.team === 'home' ? 'local' : 'visitante'}! (${datos.home}-${datos.away})`,
+        VAR_CHECK:       `VAR revisando el gol...`,
+        GOAL_ANNULLED:   `Gol ANULADO por el VAR → (${datos.home}-${datos.away})`,
+        MATCH_CONTINUES: `VAR confirma el gol ✔`,
+        MATCH_END:       `Partido finalizado`,
+      }[tipo] || `Evento: ${tipo}`;
+
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <span class="log-icon">${icono}</span>
+        <span class="log-time">${hora}</span>
+        <span class="log-text">${texto}</span>
+      `;
+
+      // Insertamos al inicio del log
+      logList.insertBefore(li, logList.firstChild);
+
+      // Maximo 20 entradas en el log
+      while (logList.children.length > 20) {
+        logList.removeChild(logList.lastChild);
+      }
+    }
+
+    // ── Procesa un mensaje entrante del WebSocket ─────────────────────────────
+    function procesarMensaje(datos) {
+      const tipo = datos.event_type;
+
+      // 1. Actualiza marcador si hay scores
+      if (typeof datos.home === 'number' && typeof datos.away === 'number') {
+        actualizarMarcador(datos.home, datos.away, tipo);
+      }
+
+      // 2. Maneja estado VAR
+      actualizarVAR(tipo);
+
+      // 3. Actualiza linea de ultimo evento
+      const mensajes = {
+        KICKOFF:         '🏁 ¡Partido iniciado!',
+        GOAL:            `⚽ ¡GOL del equipo ${datos.team === 'home' ? 'local' : 'visitante'}!`,
+        VAR_CHECK:       '📺 VAR revisando la jugada...',
+        GOAL_ANNULLED:   '❌ ¡Gol anulado por el VAR!',
+        MATCH_CONTINUES: '✅ El VAR confirma el gol',
+        MATCH_END:       '🏆 Partido finalizado',
+      };
+      lastEvent.textContent = mensajes[tipo] || `Evento: ${tipo}`;
+      lastEvent.className = 'last-event';
+      if (tipo === 'GOAL')          lastEvent.classList.add('goal');
+      if (tipo === 'GOAL_ANNULLED') lastEvent.classList.add('annul');
+      if (tipo === 'VAR_CHECK')     lastEvent.classList.add('var');
+
+      // 4. Agrega al log
+      agregarLog(datos);
+    }
+
+    // ── Conexion WebSocket con reconexion automatica ──────────────────────────
+    function conectar() {
+      setEstadoConexion('connecting');
+      ws = new WebSocket(WS_URL);
+
+      ws.onopen = () => {
+        setEstadoConexion('connected');
+        console.log('[WS] Conectado al dashboard_backend');
+      };
+
+      ws.onmessage = (evento) => {
+        try {
+          const datos = JSON.parse(evento.data);
+          console.log('[WS] Mensaje recibido:', datos);
+          procesarMensaje(datos);
+        } catch (e) {
+          console.error('[WS] Error parseando mensaje:', e);
+        }
+      };
+
+      ws.onclose = () => {
+        setEstadoConexion('disconnected');
+        console.warn('[WS] Conexion cerrada. Reintentando en 3s...');
+        setTimeout(conectar, 3000);
+      };
+
+      ws.onerror = (e) => {
+        console.error('[WS] Error:', e);
+      };
+    }
+
+    function setEstadoConexion(estado) {
+      connDot.className = `conn-dot ${estado}`;
+      connLabel.textContent = {
+        connecting:    'Conectando...',
+        connected:     'En vivo',
+        disconnected:  'Reconectando...',
+      }[estado];
+    }
+
+    // ── Arranque ──────────────────────────────────────────────────────────────
+    conectar();
+  </script>
+</body>
+</html>
