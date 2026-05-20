@@ -143,6 +143,36 @@ services:
     networks:
       - var-network
 
+  dashboard_backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: dashboard_backend
+    ports:
+      - "3003:3003"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - var-network
+    restart: on-failure
+
+  notification_backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.notification
+    container_name: notification_backend
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - var-network
+    restart: on-failure
+
 networks:
   var-network:
     driver: bridge
