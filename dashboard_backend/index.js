@@ -194,7 +194,8 @@ async function conectarRabbitMQ() {
  * POST /reiniciar
  *   1. Resetea ultimoEstado a null
  *   2. Broadcast KICKOFF 0-0 a todos los clientes WebSocket
- *   3. Reinicia el contenedor live_feed_producer via docker restart
+ *   3. Publica { command: "RESTART" } a la cola restart_commands de RabbitMQ
+ *      para que el live_feed_producer vuelva a correr el partido desde KICKOFF
  */
 app.post('/reiniciar', (req, res) => {
   console.log('[HTTP] POST /reiniciar recibido');
@@ -211,14 +212,23 @@ app.post('/reiniciar', (req, res) => {
     timestamp: new Date().toISOString(),
   });
 
-  // 3. Reiniciar el contenedor live_feed_producer
-  require('child_process').exec('docker restart live_feed_producer', (err, stdout) => {
-    if (err) {
-      console.error('[HTTP] Error reiniciando live_feed_producer:', err.message);
-    } else {
-      console.log('[HTTP] live_feed_producer reiniciado:', stdout.trim());
+  // 3. Publicar señal RESTART a RabbitMQ para que el live_feed_producer
+  //    comience un nuevo partido sin necesidad de reiniciar el contenedor
+  if (rabbitChannel) {
+    try {
+      rabbitChannel.assertQueue('restart_commands', { durable: true });
+      rabbitChannel.sendToQueue(
+        'restart_commands',
+        Buffer.from(JSON.stringify({ command: 'RESTART' })),
+        { persistent: true }
+      );
+      console.log('[HTTP] Comando RESTART publicado a restart_commands');
+    } catch (err) {
+      console.error('[HTTP] Error publicando RESTART:', err.message);
     }
-  });
+  } else {
+    console.warn('[HTTP] rabbitChannel no disponible aún');
+  }
 
   res.json({ ok: true });
 });

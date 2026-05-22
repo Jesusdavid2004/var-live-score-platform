@@ -37,4 +37,8 @@ module.exports = {
   // Simula los ~20 segundos reales que tarda el árbitro en revisar.
   // Se convierte a número porque process.env siempre devuelve string.
   varDelayMs: Number(process.env.VAR_DELAY_MS || 20000),
+
+  // URL de conexión a RabbitMQ. Se usa para suscribirse a la cola
+  // restart_commands y recibir la señal de reinicio del partido.
+  rabbitmqUrl: process.env.RABBITMQ_URL || "amqp://guest:guest@rabbitmq:5672",
 };

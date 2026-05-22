@@ -1,69 +1,105 @@
 // ============================================================
 // index.js — Punto de entrada del live_feed_producer
 // ============================================================
-// Este es el archivo que Node.js ejecuta al arrancar el servicio.
-// Su única responsabilidad es orquestar el ciclo de vida del
-// productor: conectar a Kafka, correr el escenario y desconectar.
+// Ciclo de vida:
+//   1. Conecta a Kafka
+//   2. Corre el partido completo UNA sola vez
+//   3. Se queda esperando un mensaje { "command": "RESTART" }
+//      en la cola RabbitMQ "restart_commands"
+//   4. Al recibirlo, vuelve a correr el partido desde KICKOFF
+//   5. Repite desde el paso 3 indefinidamente
 //
-// ¿Por qué separar la lógica en otros módulos?
-// Si todo estuviera aquí el archivo crecería indefinidamente.
-// Separar cada responsabilidad (config, kafka, events, scenario)
-// hace el código más mantenible y fácil de explicar.
+// Esto permite que el botón "Reiniciar Partido" del dashboard
+// controle exactamente cuándo empieza cada partido, sin tener
+// que reiniciar el contenedor Docker.
 // ============================================================
 
-// Importamos el productor Kafka ya instanciado (no lo creamos aquí)
+const amqp    = require("amqplib");
 const { producer } = require("./kafka");
-
-// Importamos el escenario del partido que define la secuencia de eventos
 const { runScenario } = require("./scenario");
-
-// sleep: necesario para la pausa entre repeticiones del partido
 const { sleep } = require("./utils");
+const { rabbitmqUrl } = require("./config");
 
-// Segundos de espera entre el fin de un partido y el inicio del siguiente
-const PAUSA_ENTRE_PARTIDOS_MS = 10000;
+const RESTART_QUEUE = "restart_commands";
+
+// ------------------------------------------------------------
+// esperarReinicio()
+// Bloquea hasta recibir { "command": "RESTART" } en la cola
+// restart_commands de RabbitMQ. Reintenta la conexión cada 5s
+// si RabbitMQ no está disponible o se cae.
+// ------------------------------------------------------------
+async function esperarReinicio() {
+  while (true) {
+    let conn;
+    try {
+      conn = await amqp.connect(rabbitmqUrl);
+      const ch = await conn.createChannel();
+      await ch.assertQueue(RESTART_QUEUE, { durable: true });
+
+      console.log("[PRODUCER] Esperando señal de reinicio en restart_commands...");
+
+      await new Promise((resolve, reject) => {
+        conn.on("close", () => reject(new Error("RabbitMQ conexion cerrada")));
+        conn.on("error", reject);
+
+        ch.consume(RESTART_QUEUE, (msg) => {
+          if (!msg) return;
+          try {
+            const data = JSON.parse(msg.content.toString());
+            if (data.command === "RESTART") {
+              ch.ack(msg);
+              resolve();
+            } else {
+              ch.ack(msg);
+            }
+          } catch (_) {
+            ch.nack(msg, false, false);
+          }
+        });
+      });
+
+      await ch.close().catch(() => {});
+      await conn.close().catch(() => {});
+      return; // señal recibida → salir y correr el partido
+
+    } catch (err) {
+      console.error("[PRODUCER] Error esperando reinicio:", err.message);
+      if (conn) await conn.close().catch(() => {});
+      console.log("[PRODUCER] Reintentando conexión a RabbitMQ en 5s...");
+      await sleep(5000);
+    }
+  }
+}
 
 // ------------------------------------------------------------
 // start()
-// Función principal asíncrona que controla todo el ciclo de vida
-// del productor.
-//
-// Ejecuta el escenario completo en un bucle infinito:
-//   1. Conecta a Kafka (una sola vez)
-//   2. Corre el partido completo (runScenario)
-//   3. Espera PAUSA_ENTRE_PARTIDOS_MS milisegundos
-//   4. Vuelve al paso 2 indefinidamente
-//
-// El contenedor nunca termina por sí solo; solo se detiene si
-// Docker lo para explícitamente o si ocurre un error fatal.
+// Orquesta el ciclo completo: conecta Kafka, corre el primer
+// partido y luego espera señales de reinicio indefinidamente.
 // ------------------------------------------------------------
 async function start() {
   try {
-    // Establece la conexión TCP con el broker de Kafka.
-    // Si Kafka no está disponible, lanzará una excepción aquí.
     await producer.connect();
     console.log("[PRODUCER] Conectado a Kafka");
 
-    // Bucle infinito: el partido se repite automáticamente
+    // Primer partido al arrancar
+    console.log("[PRODUCER] ── Iniciando primer partido ──");
+    await runScenario();
+    console.log("[PRODUCER] Partido finalizado. Esperando reinicio...");
+
+    // Bucle: esperar RESTART → correr partido → repetir
     while (true) {
-      console.log("[PRODUCER] ── Iniciando nuevo partido ──");
+      await esperarReinicio();
+      console.log("[PRODUCER] ── Reiniciando partido ──");
       await runScenario();
-      console.log(`[PRODUCER] Partido finalizado. Reiniciando en ${PAUSA_ENTRE_PARTIDOS_MS / 1000}s...`);
-      await sleep(PAUSA_ENTRE_PARTIDOS_MS);
+      console.log("[PRODUCER] Partido finalizado. Esperando reinicio...");
     }
 
   } catch (error) {
-    // Si hay algún error en la conexión o en el escenario,
-    // lo registramos en consola para facilitar el diagnóstico
-    console.error("[PRODUCER] Error:", error);
-
+    console.error("[PRODUCER] Error fatal:", error);
   } finally {
-    // La cláusula finally se ejecuta SIEMPRE, incluso si hubo error.
-    // Desconectamos limpiamente para liberar los recursos de red.
     await producer.disconnect();
     console.log("[PRODUCER] Desconectado de Kafka");
   }
 }
 
-// Llamamos a start() inmediatamente al ejecutar este archivo.
 start();
