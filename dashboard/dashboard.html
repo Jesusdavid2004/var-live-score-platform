@@ -283,77 +283,161 @@
   </div>
 
   <!-- Boton de reinicio del partido -->
+  <!-- disabled: el partido arranca solo al iniciar el contenedor, el botón
+       solo debe habilitarse cuando el partido termine (MATCH_END) -->
   <button class="btn-reiniciar" id="btnReiniciar" onclick="reiniciarPartido()" disabled>
     🔄 Reiniciar Partido
   </button>
+  <!-- Texto de ayuda que indica al usuario cuándo puede presionar el botón -->
   <p class="btn-hint" id="btnHint">Disponible cuando finalice el partido</p>
 
   <script>
-    // ── Config ────────────────────────────────────────────────────────────────
+    // =========================================================================
+    // SCRIPT PRINCIPAL DEL DASHBOARD
+    // =========================================================================
+    // Este bloque de JavaScript es el cliente del sistema VAR Live Score.
+    // Se comunica con el dashboard_backend a través de WebSocket para recibir
+    // eventos del partido en tiempo real.
+    //
+    // Flujo de datos que llega hasta aquí:
+    //   live_feed_producer → Kafka → match_state_service → RabbitMQ
+    //   → dashboard_backend (WebSocket) → ESTE SCRIPT → pantalla del usuario
+    //
+    // Responsabilidades de este script:
+    //   1. Mantener la conexión WebSocket con el dashboard_backend
+    //   2. Actualizar el marcador, el log y los indicadores visuales
+    //   3. Controlar el estado del botón "Reiniciar Partido"
+    //   4. Enviar la señal de reinicio al backend cuando el usuario lo solicita
+    // =========================================================================
+
+    // ── Configuración de la conexión WebSocket ────────────────────────────────
+    // Construimos la URL del WebSocket usando la misma dirección del servidor
+    // que sirvió esta página HTML. Así funciona tanto en local (localhost:3003)
+    // como en producción (cualquier dominio), sin hardcodear la URL.
     const WS_URL = `ws://${window.location.host}`;
 
-    // ── Referencias DOM ───────────────────────────────────────────────────────
-    const scoreHome = document.getElementById('scoreHome');
-    const scoreAway = document.getElementById('scoreAway');
-    const lastEvent = document.getElementById('lastEvent');
-    const varBanner = document.getElementById('varBanner');
-    const matchCard = document.getElementById('matchCard');
-    const logList   = document.getElementById('logList');
-    const connDot      = document.getElementById('connDot');
-    const connLabel    = document.getElementById('connLabel');
-    const btnReiniciar = document.getElementById('btnReiniciar');
-    const btnHint      = document.getElementById('btnHint');
+    // ── Referencias a elementos del DOM ──────────────────────────────────────
+    // Guardamos referencias a los elementos HTML que necesitamos actualizar
+    // dinámicamente. Es más eficiente guardarlas aquí que buscarlas en el DOM
+    // cada vez que necesitemos actualizarlas (getElementById es costoso en loops).
+    const scoreHome    = document.getElementById('scoreHome');    // Número goles local
+    const scoreAway    = document.getElementById('scoreAway');    // Número goles visitante
+    const lastEvent    = document.getElementById('lastEvent');    // Texto del último evento
+    const varBanner    = document.getElementById('varBanner');    // Banner naranja del VAR
+    const matchCard    = document.getElementById('matchCard');    // Tarjeta del partido
+    const logList      = document.getElementById('logList');      // Lista de eventos del log
+    const connDot      = document.getElementById('connDot');      // Punto de color del indicador
+    const connLabel    = document.getElementById('connLabel');    // Texto del indicador
+    const btnReiniciar = document.getElementById('btnReiniciar'); // Botón reiniciar partido
+    const btnHint      = document.getElementById('btnHint');      // Texto de ayuda del botón
 
-    // ── Estado local ──────────────────────────────────────────────────────────
+    // ── Variables de estado del cliente ──────────────────────────────────────
+    // 'ws' guarda la instancia activa del WebSocket. La declaramos aquí (fuera
+    // de conectar()) para poder acceder a ella desde cualquier función si fuera
+    // necesario cerrarla manualmente.
     let ws;
+
+    // 'varActivo' rastrea si el VAR está en revisión en este momento.
+    // Se usa para evitar cerrar el banner VAR ante eventos que no deberían cerrarlo.
     let varActivo = false;
 
-    // ── Iconos por tipo de evento ─────────────────────────────────────────────
+    // ── Mapa de iconos por tipo de evento ─────────────────────────────────────
+    // Cada tipo de evento del partido tiene un emoji asociado que se muestra
+    // en el log de eventos. Usar un objeto como mapa es más limpio que un
+    // switch/case y más fácil de extender si se agregan nuevos tipos de evento.
     const ICONOS = {
-      KICKOFF:       '🏁',
-      GOAL:          '⚽',
-      VAR_CHECK:     '📺',
-      GOAL_ANNULLED: '❌',
-      MATCH_CONTINUES: '✅',
-      MATCH_END:     '🏆',
-      default:       '🔔',
+      KICKOFF:         '🏁',   // Inicio del partido
+      GOAL:            '⚽',   // Gol anotado
+      VAR_CHECK:       '📺',   // El VAR está revisando
+      GOAL_ANNULLED:   '❌',   // El VAR anuló el gol
+      MATCH_CONTINUES: '✅',   // El VAR confirmó el gol
+      MATCH_END:       '🏆',   // Fin del partido
+      default:         '🔔',   // Cualquier otro evento no listado
     };
 
-    // ── Actualiza el marcador con animacion ───────────────────────────────────
+    // =========================================================================
+    // FUNCIÓN: actualizarMarcador(home, away, tipo)
+    // =========================================================================
+    // Actualiza los números del marcador en pantalla y aplica una animación
+    // visual para que el usuario note el cambio (efecto "bump").
+    //
+    // Parámetros:
+    //   home  → número de goles del equipo local
+    //   away  → número de goles del equipo visitante
+    //   tipo  → tipo de evento (para elegir el color de la animación)
+    //
+    // ¿Por qué la animación?
+    // En un marcador en vivo, el usuario puede estar mirando otra parte de
+    // la pantalla. La animación llama su atención sin necesitar una alerta.
+    // =========================================================================
     function actualizarMarcador(home, away, tipo) {
+      // Si el gol fue anulado usamos la clase 'bump-down' (color rojo/reducción)
+      // para diferenciarlo visualmente de un gol normal (color azul/ampliación)
       const animClass = tipo === 'GOAL_ANNULLED' ? 'bump-down' : 'bump';
 
+      // Actualizamos el texto de ambos marcadores con los nuevos valores
       scoreHome.textContent = home;
       scoreAway.textContent = away;
 
-      // Animacion de "bump" al cambiar marcador
+      // Aplicamos la clase CSS de animación a ambos números del marcador
       scoreHome.classList.add(animClass);
       scoreAway.classList.add(animClass);
+
+      // Después de 400ms removemos la clase para que la animación pueda
+      // volver a activarse en el próximo evento. Sin este setTimeout,
+      // la clase quedaría pegada y la animación no se repetiría.
       setTimeout(() => {
         scoreHome.classList.remove('bump', 'bump-down');
         scoreAway.classList.remove('bump', 'bump-down');
       }, 400);
     }
 
-    // ── Actualiza el banner VAR ───────────────────────────────────────────────
+    // =========================================================================
+    // FUNCIÓN: actualizarVAR(tipo)
+    // =========================================================================
+    // Controla la visibilidad del banner naranja "VAR EN REVISIÓN" y el
+    // borde naranja de la tarjeta del partido.
+    //
+    // ¿Por qué existe esta función separada?
+    // Centralizar la lógica del VAR evita duplicar condiciones en otros lugares.
+    // Si en el futuro cambia el comportamiento del VAR, solo se toca aquí.
+    // =========================================================================
     function actualizarVAR(tipo) {
       if (tipo === 'VAR_CHECK') {
+        // Cuando el VAR entra en acción: mostramos el banner y resaltamos la tarjeta
         varActivo = true;
-        varBanner.classList.add('visible');
-        matchCard.classList.add('var-active');
+        varBanner.classList.add('visible');    // Hace visible el banner (display: flex)
+        matchCard.classList.add('var-active'); // Agrega el borde naranja a la tarjeta
       } else if (['GOAL_ANNULLED', 'MATCH_CONTINUES', 'GOAL'].includes(tipo)) {
+        // Cuando el VAR toma una decisión (anula o confirma), ocultamos el banner.
+        // También lo ocultamos si llega un GOAL porque eso cierra el episodio VAR.
         varActivo = false;
-        varBanner.classList.remove('visible');
-        matchCard.classList.remove('var-active');
+        varBanner.classList.remove('visible');    // Oculta el banner
+        matchCard.classList.remove('var-active'); // Quita el borde naranja
       }
+      // Para KICKOFF, FOUL, MATCH_END no hacemos nada con el VAR
     }
 
-    // ── Agrega una fila al log de eventos ─────────────────────────────────────
+    // =========================================================================
+    // FUNCIÓN: agregarLog(datos)
+    // =========================================================================
+    // Agrega una nueva fila al log de eventos en tiempo real que aparece
+    // debajo de la tarjeta del partido.
+    //
+    // ¿Por qué insertar al inicio (insertBefore) y no al final (appendChild)?
+    // El evento más reciente debe aparecer primero. Es más intuitivo para el
+    // usuario ver el último evento en la parte de arriba del log.
+    //
+    // Parámetro:
+    //   datos → objeto con los campos del evento (event_type, home, away, team...)
+    // =========================================================================
     function agregarLog(datos) {
-      const tipo  = datos.event_type || 'INFO';
-      const icono = ICONOS[tipo] || ICONOS.default;
-      const hora  = new Date().toLocaleTimeString('es-CO', { hour12: false });
+      const tipo  = datos.event_type || 'INFO';           // Tipo de evento o 'INFO' por defecto
+      const icono = ICONOS[tipo] || ICONOS.default;       // Emoji del tipo de evento
+      const hora  = new Date().toLocaleTimeString('es-CO', { hour12: false }); // Hora actual en formato HH:MM:SS
 
+      // Generamos el texto descriptivo según el tipo de evento.
+      // El operador || al final maneja cualquier evento no listado.
       const texto = {
         KICKOFF:         `Partido iniciado`,
         GOAL:            `¡GOL del equipo ${datos.team === 'home' ? 'local' : 'visitante'}! (${datos.home}-${datos.away})`,
@@ -363,6 +447,7 @@
         MATCH_END:       `Partido finalizado`,
       }[tipo] || `Evento: ${tipo}`;
 
+      // Creamos el elemento <li> de la lista con la estructura de iconos y texto
       const li = document.createElement('li');
       li.innerHTML = `
         <span class="log-icon">${icono}</span>
@@ -370,28 +455,47 @@
         <span class="log-text">${texto}</span>
       `;
 
-      // Insertamos al inicio del log
+      // Insertamos el nuevo elemento AL INICIO de la lista (antes del primero)
+      // para que el evento más reciente siempre aparezca en la parte de arriba
       logList.insertBefore(li, logList.firstChild);
 
-      // Maximo 20 entradas en el log
+      // Limitamos el log a 20 entradas para evitar que la lista crezca
+      // indefinidamente y afecte el rendimiento del navegador
       while (logList.children.length > 20) {
-        logList.removeChild(logList.lastChild);
+        logList.removeChild(logList.lastChild); // Eliminamos la entrada más antigua
       }
     }
 
-    // ── Procesa un mensaje entrante del WebSocket ─────────────────────────────
+    // =========================================================================
+    // FUNCIÓN: procesarMensaje(datos)
+    // =========================================================================
+    // Es la función central del dashboard. Se llama cada vez que llega un
+    // mensaje por WebSocket desde el dashboard_backend, y coordina la
+    // actualización de TODOS los elementos visuales de la página.
+    //
+    // ¿De dónde vienen los datos?
+    // El flujo completo es:
+    //   live_feed_producer → Kafka → match_state_service → RabbitMQ
+    //   → dashboard_backend → WebSocket → ws.onmessage → procesarMensaje()
+    //
+    // Parámetro:
+    //   datos → objeto JSON con: { event_type, home, away, match_id, team, ... }
+    // =========================================================================
     function procesarMensaje(datos) {
-      const tipo = datos.event_type;
+      const tipo = datos.event_type; // Extraemos el tipo de evento para usarlo en todas las decisiones
 
-      // 1. Actualiza marcador si hay scores
+      // Paso 1: Actualizar el marcador SOLO si el mensaje incluye puntuaciones.
+      // No todos los eventos cambian el marcador (ej: FOUL no tiene home/away).
+      // typeof number asegura que 0 también se detecte (0 es falsy en JS).
       if (typeof datos.home === 'number' && typeof datos.away === 'number') {
         actualizarMarcador(datos.home, datos.away, tipo);
       }
 
-      // 2. Maneja estado VAR
+      // Paso 2: Manejar el estado visual del VAR (banner naranja y borde)
       actualizarVAR(tipo);
 
-      // 3. Actualiza linea de ultimo evento
+      // Paso 3: Actualizar la línea de "último evento" debajo del marcador.
+      // Cada tipo de evento tiene su propio mensaje amigable para el usuario.
       const mensajes = {
         KICKOFF:         '🏁 ¡Partido iniciado!',
         GOAL:            `⚽ ¡GOL del equipo ${datos.team === 'home' ? 'local' : 'visitante'}!`,
@@ -400,111 +504,226 @@
         MATCH_CONTINUES: '✅ El VAR confirma el gol',
         MATCH_END:       '🏆 Partido finalizado',
       };
+      // Actualizamos el texto; si el tipo no está en el mapa, mostramos el tipo crudo
       lastEvent.textContent = mensajes[tipo] || `Evento: ${tipo}`;
-      lastEvent.className = 'last-event';
-      if (tipo === 'GOAL')          lastEvent.classList.add('goal');
-      if (tipo === 'GOAL_ANNULLED') lastEvent.classList.add('annul');
-      if (tipo === 'VAR_CHECK')     lastEvent.classList.add('var');
 
-      // 4. Agrega al log
+      // Reseteamos las clases de color del texto (goal=azul, annul=rojo, var=naranja)
+      // y aplicamos la que corresponde al tipo de evento actual
+      lastEvent.className = 'last-event';
+      if (tipo === 'GOAL')          lastEvent.classList.add('goal');  // Azul para goles
+      if (tipo === 'GOAL_ANNULLED') lastEvent.classList.add('annul'); // Rojo para anulaciones
+      if (tipo === 'VAR_CHECK')     lastEvent.classList.add('var');   // Naranja para VAR
+
+      // Paso 4: Agregar el evento al log cronológico que el usuario puede revisar
       agregarLog(datos);
 
-      // 5. Actualiza indicador y estado del botón según el evento
+      // Paso 5: Actualizar el indicador de estado del partido (esquina superior derecha)
+      // y el estado habilitado/deshabilitado del botón "Reiniciar Partido"
       if (tipo === 'MATCH_END') {
+        // El partido terminó: indicador rojo y habilitamos el botón para reiniciar
         setEstadoConexion('finished');
-        setBotonHabilitado(true);
+        setBotonHabilitado(true);  // El usuario ya puede presionar "Reiniciar Partido"
       } else {
+        // El partido está en curso: indicador verde
         setEstadoConexion('live');
-        if (tipo === 'KICKOFF') setBotonHabilitado(false);
+        if (tipo === 'KICKOFF') {
+          // Al inicio de un nuevo partido deshabilitamos el botón: no tiene sentido
+          // reiniciar un partido que acaba de comenzar
+          setBotonHabilitado(false);
+        }
       }
     }
 
-    // ── Conexion WebSocket con reconexion automatica ──────────────────────────
+    // =========================================================================
+    // FUNCIÓN: conectar()
+    // =========================================================================
+    // Establece la conexión WebSocket con el dashboard_backend y configura
+    // todos los manejadores de eventos (onopen, onmessage, onclose, onerror).
+    //
+    // ¿Por qué reconexión automática?
+    // En sistemas distribuidos las conexiones de red pueden caerse en cualquier
+    // momento (reinicio del servidor, corte de red, etc.). La reconexión automática
+    // garantiza que el dashboard vuelva a funcionar sin que el usuario tenga que
+    // recargar la página manualmente.
+    // =========================================================================
     function conectar() {
+      // Indicamos visualmente que estamos intentando conectar (punto naranja pulsante)
       setEstadoConexion('connecting');
+
+      // Creamos la conexión WebSocket apuntando al mismo servidor que sirvió el HTML
       ws = new WebSocket(WS_URL);
 
+      // ── Evento: conexión establecida con éxito ────────────────────────────
       ws.onopen = () => {
+        // Mientras no llegue el primer evento del partido, mostramos "Conectando..."
+        // porque no sabemos aún si hay un partido en curso o esperando
         setEstadoConexion('connecting');
         console.log('[WS] Conectado al dashboard_backend');
       };
 
+      // ── Evento: llegó un mensaje del dashboard_backend ────────────────────
       ws.onmessage = (evento) => {
+        // 'evento.data' es el string JSON que envió el servidor
         try {
-          const datos = JSON.parse(evento.data);
+          const datos = JSON.parse(evento.data); // Convertimos el string a objeto JS
           console.log('[WS] Mensaje recibido:', datos);
-          procesarMensaje(datos);
+          procesarMensaje(datos); // Delegamos el procesamiento a la función principal
         } catch (e) {
+          // Si el JSON está malformado (problema en el servidor), lo registramos
+          // pero NO rompemos la conexión: el siguiente mensaje puede ser válido
           console.error('[WS] Error parseando mensaje:', e);
         }
       };
 
+      // ── Evento: conexión cerrada (servidor caído, red cortada, etc.) ──────
       ws.onclose = () => {
+        // Actualizamos el indicador a gris "Sin conexión"
         setEstadoConexion('disconnected');
         console.warn('[WS] Conexion cerrada. Reintentando en 3s...');
+        // Intentamos reconectar después de 3 segundos.
+        // Usamos setTimeout (no setInterval) para que cada intento
+        // sea un ciclo completo de conectar(), evitando conexiones duplicadas.
         setTimeout(conectar, 3000);
       };
 
+      // ── Evento: error en la conexión WebSocket ────────────────────────────
       ws.onerror = (e) => {
+        // El error generalmente va seguido de un onclose, así que la reconexión
+        // ya está manejada allí. Aquí solo registramos para debugging.
         console.error('[WS] Error:', e);
       };
     }
 
+    // =========================================================================
+    // FUNCIÓN: setEstadoConexion(estado)
+    // =========================================================================
+    // Actualiza el indicador visual de estado en la esquina superior derecha
+    // de la pantalla. Cambia el color del punto y el texto según el estado.
+    //
+    // Estados posibles:
+    //   connecting   → 🟠 Naranja pulsante: conectando o esperando primer evento
+    //   restarting   → 🟠 Naranja pulsante: reiniciando el partido
+    //   live         → 🟢 Verde: partido en curso con eventos llegando
+    //   finished     → 🔴 Rojo: el partido terminó (MATCH_END recibido)
+    //   disconnected → ⚫ Gris: sin conexión WebSocket con el servidor
+    // =========================================================================
     function setEstadoConexion(estado) {
+      // La clase CSS determina el color y animación del punto indicador
+      // (definidos en el bloque <style> de este mismo archivo)
       connDot.className = `conn-dot ${estado}`;
+
+      // Mapeamos cada estado a su etiqueta de texto visible al usuario
       connLabel.textContent = {
-        connecting:    'Conectando...',
-        restarting:    'Reiniciando...',
-        live:          'En vivo',
-        finished:      'Finalizado',
-        disconnected:  'Sin conexión',
-      }[estado] || estado;
+        connecting:    'Conectando...',   // Esperando primera conexión o primer evento
+        restarting:    'Reiniciando...',  // Se envió la señal de reinicio al backend
+        live:          'En vivo',         // Partido activo, eventos llegando
+        finished:      'Finalizado',      // MATCH_END recibido, partido terminó
+        disconnected:  'Sin conexión',    // WebSocket cerrado, intentando reconectar
+      }[estado] || estado; // Si el estado no está en el mapa, mostramos el estado crudo
     }
 
+    // =========================================================================
+    // FUNCIÓN: setBotonHabilitado(habilitado)
+    // =========================================================================
+    // Controla si el botón "Reiniciar Partido" está activo (clickeable) o
+    // deshabilitado (gris, no responde al click).
+    //
+    // ¿Por qué deshabilitar el botón durante el partido?
+    // No tiene sentido reiniciar un partido que ya está corriendo. Si el usuario
+    // pudiera presionar el botón en cualquier momento, podría interrumpir el
+    // partido a mitad y causar inconsistencias en el estado del sistema.
+    //
+    // Reglas:
+    //   MATCH_END → habilitado = true  (el partido terminó, se puede reiniciar)
+    //   KICKOFF   → habilitado = false (nuevo partido empezó, no interrumpir)
+    //
+    // Parámetro:
+    //   habilitado → true para activar el botón, false para desactivarlo
+    // =========================================================================
     function setBotonHabilitado(habilitado) {
+      // La propiedad 'disabled' del elemento <button> controla si responde a clicks.
+      // true = deshabilitado (gris, no clickeable) / false = habilitado (activo)
       btnReiniciar.disabled = !habilitado;
+
+      // El texto de ayuda ("Disponible cuando finalice el partido") se oculta
+      // cuando el botón está activo y aparece cuando está deshabilitado,
+      // para guiar al usuario sobre cuándo puede usar el botón.
       btnHint.style.visibility = habilitado ? 'hidden' : 'visible';
     }
 
-    // ── Reiniciar partido ─────────────────────────────────────────────────────
+    // =========================================================================
+    // FUNCIÓN ASYNC: reiniciarPartido()
+    // =========================================================================
+    // Se ejecuta cuando el usuario presiona el botón "Reiniciar Partido".
+    // Realiza la limpieza visual del dashboard Y envía la señal de reinicio
+    // al dashboard_backend, que a su vez la reenvía al live_feed_producer
+    // a través de la cola RabbitMQ "restart_commands".
+    //
+    // Es async porque necesita esperar la respuesta del servidor (await fetch)
+    // antes de actualizar el indicador final.
+    //
+    // Flujo que desencadena esta función:
+    //   1. Click del usuario
+    //   2. Limpieza visual inmediata (UX responsiva)
+    //   3. POST /reiniciar → dashboard_backend → RabbitMQ → live_feed_producer
+    //   4. El producer publica KICKOFF → Kafka → match_state_service → RabbitMQ
+    //   5. dashboard_backend recibe por RabbitMQ y hace broadcast WebSocket
+    //   6. procesarMensaje() recibe el KICKOFF y actualiza la pantalla
+    // =========================================================================
     async function reiniciarPartido() {
-      // 1. Indicador naranja "Reiniciando..." y deshabilitar botón de inmediato
+      // Paso 1: Cambiar el indicador a naranja "Reiniciando..." y deshabilitar
+      // el botón INMEDIATAMENTE para evitar que el usuario lo presione dos veces
+      // mientras se procesa la solicitud (doble click = dos partidos simultáneos)
       setEstadoConexion('restarting');
       setBotonHabilitado(false);
 
-      // 2. Limpiar marcador a 0-0
+      // Paso 2: Actualizar el marcador a 0-0 de forma inmediata para dar
+      // feedback visual instantáneo al usuario, sin esperar la respuesta del servidor
       scoreHome.textContent = '0';
       scoreAway.textContent = '0';
 
-      // 3. Limpiar el log y agregar entrada de reinicio
-      logList.innerHTML = '';
-      const li = document.createElement('li');
+      // Paso 3: Limpiar el log de eventos del partido anterior
+      // y agregar una entrada que indica que se está reiniciando
+      logList.innerHTML = ''; // Vaciamos completamente el log
+      const li = document.createElement('li'); // Creamos el elemento de lista
       li.innerHTML = `
         <span class="log-icon">🔄</span>
         <span class="log-time">${new Date().toLocaleTimeString('es-CO', { hour12: false })}</span>
         <span class="log-text">Reiniciando partido...</span>
       `;
-      logList.insertBefore(li, logList.firstChild);
+      logList.insertBefore(li, logList.firstChild); // Lo ponemos al inicio del log
 
-      // 4. Restablecer estado visual del partido
-      lastEvent.textContent = 'Esperando inicio del partido...';
-      lastEvent.className = 'last-event';
-      varBanner.classList.remove('visible');
-      matchCard.classList.remove('var-active');
+      // Paso 4: Restablecer todos los elementos visuales al estado inicial
+      lastEvent.textContent = 'Esperando inicio del partido...'; // Texto neutro
+      lastEvent.className = 'last-event';            // Sin clases de color (goal/annul/var)
+      varBanner.classList.remove('visible');          // Ocultamos el banner del VAR
+      matchCard.classList.remove('var-active');       // Quitamos el borde naranja de la tarjeta
 
-      // 5. Llamar al backend y al recibir ok → pasar a "En vivo"
+      // Paso 5: Llamar al endpoint del backend que publica el mensaje RESTART
+      // a la cola RabbitMQ "restart_commands", que el live_feed_producer escucha
       try {
+        // fetch() hace una petición HTTP POST al mismo servidor que sirve esta página
         const resp = await fetch('/reiniciar', { method: 'POST' });
-        const data = await resp.json();
+        const data = await resp.json(); // Parseamos la respuesta { ok: true }
+
+        // Si el backend confirmó el reinicio, pasamos el indicador a verde "En vivo"
+        // porque el live_feed_producer ya está corriendo el nuevo partido
         if (data.ok) setEstadoConexion('live');
       } catch (e) {
+        // Si el servidor no responde (caído, red cortada), mostramos gris "Sin conexión"
         console.error('[RESET] Error al llamar /reiniciar:', e);
         setEstadoConexion('disconnected');
       }
     }
 
-    // ── Arranque ──────────────────────────────────────────────────────────────
-    conectar();
+    // =========================================================================
+    // ARRANQUE DEL CLIENTE
+    // =========================================================================
+    // Esta es la última línea del script: inicia la conexión WebSocket.
+    // Todo lo demás son definiciones de funciones que se ejecutarán cuando
+    // lleguen eventos del WebSocket o el usuario interactúe con la página.
+    // =========================================================================
+    conectar(); // Inicia la conexión WebSocket con el dashboard_backend
   </script>
 </body>
 </html>

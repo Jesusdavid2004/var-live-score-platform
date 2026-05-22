@@ -1,145 +1,204 @@
-/**
- * notification_backend/index.js — Consumer de alertas en tiempo real
- * ===================================================================
- * Este servicio actúa como el sistema de notificaciones del proyecto.
- * Se suscribe al Fanout Exchange "live_alerts" de RabbitMQ y recibe
- * TODAS las alertas del partido: goles, revisiones VAR, goles anulados.
- *
- * En un sistema real de producción, aquí se enviarían:
- *   - Push notifications al celular de los usuarios
- *   - Correos electrónicos con resumen de goles
- *   - SMS a suscriptores premium
- *   - Mensajes a Slack/Teams para el equipo de operaciones
- *
- * Para el ejercicio académico: las alertas se muestran en consola
- * con formato visual claro y diferenciado por severidad.
- *
- * ¿Por qué un servicio separado para notificaciones?
- * Principio de responsabilidad única: el dashboard_backend maneja
- * la visualización del marcador; este servicio maneja las alertas.
- * Así se pueden escalar y desplegar de forma independiente.
- */
+// =============================================================================
+// notification_backend/index.js — Consumer de alertas en tiempo real
+// =============================================================================
+// Este servicio es el sistema de notificaciones del proyecto VAR Live Score.
+// Se suscribe al Fanout Exchange "live_alerts" de RabbitMQ y recibe TODAS
+// las alertas importantes del partido: goles, revisiones VAR, goles anulados.
+//
+// ¿Por qué existe un servicio separado para notificaciones?
+// Principio de Responsabilidad Única (SRP): el dashboard_backend se encarga
+// de la visualización del marcador; este servicio se encarga de las alertas.
+// Al estar separados, se pueden escalar de forma independiente:
+//   - Si hay muchos usuarios en el dashboard → escalar dashboard_backend
+//   - Si hay muchos suscriptores de notificaciones → escalar notification_backend
+//
+// ¿Qué hace con las alertas recibidas?
+// En este ejercicio académico: las imprime en consola con formato visual.
+// En un sistema real de producción, aquí se enviarían:
+//   - Push notifications al celular de los usuarios (Firebase, APNs)
+//   - Correos electrónicos con resumen del gol (SendGrid, SES)
+//   - SMS a suscriptores premium (Twilio, AWS SNS)
+//   - Mensajes a Slack/Teams para el equipo de operaciones
+//
+// Posición en la arquitectura:
+//   match_state_service → RabbitMQ (live_alerts fanout) → ESTE SERVICIO → consola/notificaciones
+//
+// Puerto: 3004 (no expone HTTP, solo consume RabbitMQ)
+// =============================================================================
 
-// amqplib: cliente RabbitMQ para Node.js
+// amqplib: cliente oficial de RabbitMQ para Node.js
+// Implementa el protocolo AMQP 0-9-1 para conectarse al broker
 const amqp = require('amqplib');
 
-// URL de RabbitMQ leída desde variable de entorno
+// URL de RabbitMQ leída desde variable de entorno (.env).
+// En Docker: "amqp://guest:guest@rabbitmq:5672"
+// En local:  "amqp://guest:guest@localhost:5672"
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
 
-// Mapa de severidades a iconos visuales para la consola.
-// Facilita identificar el tipo de alerta con un solo vistazo
-// sin necesidad de leer el texto completo del mensaje.
+// =============================================================================
+// MAPA DE ICONOS POR SEVERIDAD
+// =============================================================================
+// Cada alerta tiene una severidad que indica su importancia.
+// Usamos emojis para hacer los logs más legibles de un vistazo:
+//   info    → goles normales (evento positivo esperado)
+//   warning → VAR, goles anulados (evento que cambia el estado del partido)
+//   error   → errores del sistema (algo salió mal)
+//   var     → revisión VAR específica (subcategoría de warning)
+// =============================================================================
 const ICONOS = {
-  info:    '⚽',  // Goles normales (evento positivo)
-  warning: '🚨',  // VAR, goles anulados (evento de alerta)
-  error:   '❌',  // Errores del sistema
-  var:     '📺',  // Revisión VAR específica
+  info:    '⚽',   // Gol normal: evento positivo
+  warning: '🚨',   // Gol anulado / VAR: evento de alta importancia
+  error:   '❌',   // Error del sistema
+  var:     '📺',   // Revisión VAR: el árbitro de video está actuando
 };
 
-/**
- * formatearAlerta(datos)
- * Convierte el objeto JSON de alerta en una línea de texto formateada
- * para mostrar en consola. Similar al formato de logs de producción.
- *
- * Formato de salida: "⚽ [PUSH][Partido 123] ¡GOL del equipo local!"
- *
- * @param {Object} datos - Objeto con { message, severity, match_id? }
- * @returns {string} Línea formateada para consola
- */
+// =============================================================================
+// FUNCIÓN: formatearAlerta(datos)
+// =============================================================================
+// Convierte el objeto JSON de alerta en una línea de texto formateada y
+// lista para mostrar en consola. Sirve como plantilla de salida consistente.
+//
+// Formato de salida ejemplo:
+//   "⚽ [PUSH][Partido 123] ¡GOL del equipo home!"
+//   "🚨 [PUSH][Partido 123] ¡GOL ANULADO POR EL VAR!"
+//
+// Parámetro:
+//   datos → objeto con campos { message, severity, match_id? }
+//
+// ¿Por qué separar el formateo de la impresión?
+// Separar la lógica de formateo del I/O (consola) facilita los tests unitarios
+// y permite cambiar la salida (ej: escribir a un archivo de log) sin tocar
+// la lógica de cómo se construye el mensaje.
+// =============================================================================
 function formatearAlerta(datos) {
-  // ICONOS[datos.severity] busca el icono por severidad;
-  // si la severidad no está en el mapa, usa la campana genérica
+  // Buscamos el icono correspondiente a la severidad del mensaje.
+  // Si la severidad no está en el mapa (ej: severidad nueva), usamos la campana genérica.
   const icono  = ICONOS[datos.severity] || '🔔';
 
-  // Si el mensaje incluye match_id, lo mostramos entre corchetes
-  // para que sea fácil filtrar las alertas por partido
+  // Si el mensaje incluye el ID del partido, lo mostramos entre corchetes
+  // para facilitar el filtrado cuando hay múltiples partidos simultáneos.
   const matchInfo = datos.match_id ? ` [Partido ${datos.match_id}]` : '';
 
+  // Construimos la línea final: icono + tag [PUSH] + partido + mensaje
   return `${icono} [PUSH]${matchInfo} ${datos.message}`;
 }
 
-/**
- * conectarRabbitMQ()
- * Establece la conexión con RabbitMQ y arranca el consumer de alertas.
- * Implementa reconexión automática en caso de fallo del broker.
- */
+// =============================================================================
+// FUNCIÓN ASYNC: conectarRabbitMQ()
+// =============================================================================
+// Establece la conexión con RabbitMQ, se suscribe al Fanout Exchange
+// "live_alerts" y procesa cada alerta que llega.
+//
+// ¿Por qué tiene reconexión automática?
+// En Docker, los servicios no siempre arrancan en orden. RabbitMQ puede tardar
+// unos segundos. La reconexión automática evita que este servicio muera
+// si RabbitMQ no está listo cuando arranca notification_backend.
+//
+// Flujo de datos:
+//   match_state_service → publica en "live_alerts" → cola "alerts_q"
+//   → esta función consume → formatearAlerta() → consola
+// =============================================================================
 async function conectarRabbitMQ() {
   try {
     console.log('[NOTIF] Conectando a RabbitMQ...');
+
+    // Establecemos la conexión TCP con el broker
     const connection = await amqp.connect(RABBITMQ_URL);
+
+    // Creamos el canal de comunicación sobre la conexión.
+    // Cada operación AMQP (publish, consume, ack) se hace a través del canal.
     const channel    = await connection.createChannel();
 
-    // Declaramos el Fanout Exchange (idempotente)
-    // Un fanout entrega una copia del mensaje a TODAS las colas enlazadas
+    // Declaramos el Fanout Exchange (idempotente).
+    // Un fanout entrega UNA COPIA del mensaje a TODAS las colas enlazadas.
+    // durable: true → el exchange sobrevive reinicios del broker.
     await channel.assertExchange('live_alerts', 'fanout', { durable: true });
 
-    // Cola durable: si el servicio se reinicia, los mensajes no procesados
-    // siguen en la cola esperando, no se pierden
+    // Declaramos la cola durable "alerts_q".
+    // durable: true → si RabbitMQ se reinicia, los mensajes no procesados
+    // permanecen en la cola esperando, no se pierden.
     const { queue } = await channel.assertQueue('alerts_q', { durable: true });
 
     // Enlazamos la cola al fanout exchange.
-    // El segundo argumento '' es la routing key, ignorada en fanout.
+    // La routing key '' es ignorada en fanout: todos los mensajes llegan aquí.
+    // Es el equivalente a "subscribirse" al canal de alertas del partido.
     await channel.bindQueue(queue, 'live_alerts', '');
 
     console.log('[NOTIF] ✓ Suscrito a live_alerts → alerts_q');
     console.log('[NOTIF] Esperando alertas...\n');
-    console.log('─'.repeat(50));
+    console.log('─'.repeat(50)); // Separador visual para distinguir alertas del log de arranque
 
-    // ── Consumer: procesa cada alerta que llega ──────────────────────────────
+    // ── Consumer: se ejecuta por cada alerta que llega ────────────────────────
+    // channel.consume() registra el callback que RabbitMQ invocará automáticamente
+    // cada vez que llegue un mensaje a la cola "alerts_q".
     channel.consume(queue, (msg) => {
-      if (!msg) return;
+      if (!msg) return; // null si el consumer fue cancelado por el broker
 
       try {
-        const contenido = msg.content.toString();
-        const datos     = JSON.parse(contenido);
+        const contenido = msg.content.toString(); // Buffer binario → string de texto
+        const datos     = JSON.parse(contenido);  // string JSON → objeto JavaScript
 
-        // Formateamos el mensaje para mostrar en consola
+        // Construimos la línea de texto formateada para mostrar en consola
         const linea = formatearAlerta(datos);
 
-        // Agregamos separadores visuales para alertas importantes (VAR, anulaciones)
-        // para que destaquen visualmente entre los goles normales
+        // Las alertas importantes (warning/var) van enmarcadas entre separadores
+        // para que destaquen visualmente en el flujo de logs de la consola
         if (datos.severity === 'warning' || datos.severity === 'var') {
           console.log('─'.repeat(50));
-          console.log(linea); // La alerta importante va entre separadores
+          console.log(linea); // La alerta crítica va entre las líneas de separación
           console.log('─'.repeat(50));
         } else {
-          // Goles normales y eventos informativos van sin separador
+          // Las alertas informativas (goles normales) van sin separador
           console.log(linea);
         }
 
-        // ACK: confirmamos que procesamos el mensaje correctamente
+        // ACK manual: confirmamos a RabbitMQ que el mensaje fue procesado.
+        // Solo después de este ACK el broker lo elimina de la cola.
+        // Si el servicio muere antes del ACK, RabbitMQ re-entregará el mensaje.
         channel.ack(msg);
 
       } catch (err) {
         console.error('[NOTIF] Error procesando alerta:', err.message);
-        // NACK sin re-encolar para evitar loops infinitos con mensajes malformados
+        // NACK (false, false): rechazamos el mensaje sin re-encolarlo.
+        // Re-encolar un mensaje malformado causaría un loop infinito de errores.
         channel.nack(msg, false, false);
       }
     });
 
-    // Reconexión automática si el broker cierra la conexión inesperadamente
+    // Si la conexión se cierra inesperadamente (RabbitMQ reiniciado, red cortada),
+    // esperamos 5 segundos y volvemos a conectar desde cero.
     connection.on('close', () => {
       console.warn('[NOTIF] Conexion cerrada. Reintentando en 5s...');
       setTimeout(conectarRabbitMQ, 5000);
     });
 
+    // Registramos errores de conexión para diagnóstico (no terminan el proceso)
     connection.on('error', (err) => {
       console.error('[NOTIF] Error:', err.message);
     });
 
   } catch (error) {
-    // Si RabbitMQ no está disponible todavía, reintentamos en 5 segundos
+    // Si RabbitMQ no está disponible todavía, lo intentamos de nuevo en 5 segundos.
+    // Esto es especialmente importante al arrancar en Docker donde el broker
+    // puede tardar unos segundos en estar completamente listo.
     console.error('[NOTIF] No se pudo conectar:', error.message);
     console.log('[NOTIF] Reintentando en 5 segundos...');
     setTimeout(conectarRabbitMQ, 5000);
   }
 }
 
-// ── Arranque del servicio ────────────────────────────────────────────────────
-// Mostramos el banner de inicio antes de conectar a RabbitMQ
+// =============================================================================
+// ARRANQUE DEL SERVICIO
+// =============================================================================
+// Mostramos el banner de identificación del servicio antes de conectar.
+// Luego iniciamos la conexión a RabbitMQ que mantiene el proceso corriendo
+// indefinidamente (el consumer de RabbitMQ no termina solo).
+// =============================================================================
 console.log('╔══════════════════════════════════════════════╗');
 console.log('║     VAR Platform — Notification Backend      ║');
 console.log('╚══════════════════════════════════════════════╝\n');
 
-// Iniciamos la conexión a RabbitMQ y el loop de consumo
+// Iniciamos la conexión a RabbitMQ.
+// Esta llamada hace que el proceso Node.js quede "vivo" indefinidamente
+// porque el consumer mantiene una conexión TCP abierta con el broker.
 conectarRabbitMQ();

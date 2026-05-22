@@ -1,32 +1,53 @@
-// ============================================================
-// config.js — Configuración del match_state_service
-// ============================================================
-// Parámetros de conexión a Kafka y RabbitMQ para el servicio
-// que mantiene el marcador del partido en tiempo real.
+// =============================================================================
+// match_state_service/src/config.js — Configuración del árbitro digital
+// =============================================================================
+// Centraliza TODOS los parámetros de conexión del match_state_service.
+// Este servicio es especial porque necesita DOS brokers de mensajería:
 //
-// Este servicio necesita AMBOS brokers:
-//   - Kafka: para consumir eventos del partido (fuente de verdad)
-//   - RabbitMQ: para publicar actualizaciones al dashboard
-// Por eso tiene más variables que otros servicios.
-// ============================================================
+//   - KAFKA: fuente de verdad de los eventos del partido.
+//     Consume del topic "match_events" para recibir cada KICKOFF, GOAL, etc.
+//
+//   - RABBITMQ: canal de distribución hacia el frontend y las notificaciones.
+//     Publica en "live_updates" (marcador al dashboard) y en "live_alerts" (alertas).
+//
+// Esta dualidad refleja el patrón arquitectónico del sistema:
+//   Kafka = backbone de eventos (alta durabilidad, replay, múltiples consumidores)
+//   RabbitMQ = distribución en tiempo real (baja latencia, routing flexible)
+//
+// ¿Por qué no usar solo Kafka para todo?
+// Kafka es excelente para almacenar y distribuir eventos entre servicios backend,
+// pero RabbitMQ tiene mejor soporte para patrones como Fanout (broadcast a
+// múltiples colas) y es más sencillo de integrar con WebSocket backends.
+// =============================================================================
 
+// dotenv carga el archivo .env y sus variables quedan en process.env
 require("dotenv").config();
 
 module.exports = {
-  // Dirección del broker de Kafka (contenedor Docker o localhost en dev)
+  // ── Kafka ───────────────────────────────────────────────────────────────────
+
+  // Dirección del broker de Kafka.
+  // "kafka:9092" es el hostname del contenedor Docker definido en docker-compose.yml.
+  // En desarrollo local sin Docker se usaría "localhost:29092" (puerto externo).
   kafkaBroker: process.env.KAFKA_BROKER || "kafka:9092",
 
-  // Topic del que consume los eventos. Debe coincidir con el topic
-  // creado por kafka-init y publicado por el live_feed_producer.
+  // Topic de Kafka del que se consumen los eventos.
+  // IMPORTANTE: debe ser exactamente el mismo nombre que usa el live_feed_producer
+  // al publicar y el que fue creado por kafka-init en scripts/create-topics.sh.
+  // Una discrepancia en el nombre haría que este servicio nunca reciba mensajes.
   kafkaTopic: process.env.KAFKA_TOPIC || "match_events",
 
-  // Grupo de consumidores propio de este servicio.
-  // Al tener su propio grupo, Kafka le entrega una copia de cada
-  // mensaje independientemente de lo que lean otros servicios.
+  // ID del Consumer Group de Kafka para este servicio.
+  // Al tener su propio grupo ("state-group"), Kafka garantiza que este servicio
+  // reciba TODOS los mensajes del topic, independientemente de lo que lean
+  // el historical_archiver ("historical-archiver-group") o el betting service.
   stateGroupId: process.env.STATE_GROUP_ID || "state-group",
 
-  // URL de conexión a RabbitMQ. El match_state_service publica
-  // actualizaciones de marcador en el exchange "live_updates"
-  // después de procesar cada evento de Kafka.
+  // ── RabbitMQ ────────────────────────────────────────────────────────────────
+
+  // URL completa de conexión a RabbitMQ con credenciales y host.
+  // Este servicio PUBLICA en dos exchanges de RabbitMQ:
+  //   1. "live_updates" (topic exchange): marcador actualizado → dashboard_backend
+  //   2. "live_alerts"  (fanout exchange): alertas → notification_backend
   rabbitmqUrl: process.env.RABBITMQ_URL || "amqp://guest:guest@rabbitmq:5672",
 };

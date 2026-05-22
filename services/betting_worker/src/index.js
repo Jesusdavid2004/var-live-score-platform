@@ -1,93 +1,126 @@
-// ============================================================
-// index.js — Punto de entrada del betting_worker
-// ============================================================
-// Este servicio implementa el patrón "Worker" o "Competing Consumer":
-// consume comandos de la Work Queue "betting_commands" y ejecuta
-// la acción correspondiente (suspender o reanudar apuestas).
+// =============================================================================
+// betting_worker/src/index.js — Worker de ejecución de comandos de apuestas
+// =============================================================================
+// Este servicio implementa el patrón "Worker" (también llamado "Consumer Worker"
+// o "Task Consumer"). Su único propósito es recibir comandos de la Work Queue
+// "betting_commands" y ejecutar la acción correspondiente.
 //
-// En un sistema real, aquí se llamaría a la API de la casa de
-// apuestas para bloquear/desbloquear el mercado del partido.
-// Para el ejercicio, se registra la acción en consola.
+// ¿Cuál es la diferencia entre este servicio y el betting_suspension_service?
+//   - betting_suspension_service: DECIDE cuándo actuar (lee Kafka, evalúa reglas)
+//   - betting_worker: EJECUTA la acción (lee RabbitMQ, llama a la API de apuestas)
+//
+// Esta separación sigue el patrón Command: quien genera el comando (suspension_service)
+// no necesita saber cómo se ejecuta (worker). Ventajas:
+//   - Se pueden tener múltiples workers en paralelo para mayor throughput
+//   - El suspension_service no se bloquea esperando que la API de apuestas responda
+//   - Si la API de apuestas está lenta, los comandos se acumulan en la cola
+//     y se procesan cuando el sistema se recupere (sin perder ninguno)
 //
 // Características del patrón Work Queue:
-//   - Cada mensaje es procesado por exactamente UN worker
-//   - Si hay varios workers, el broker balancea los mensajes
-//   - prefetch(1): el worker no pide otro mensaje hasta terminar el actual
-//   - noAck: false → reconocimiento manual (ACK/NACK)
-// ============================================================
+//   - prefetch(1): el worker pide un mensaje a la vez (no acumula)
+//   - noAck: false → reconocimiento manual (ACK explícito después de procesar)
+//   - Si el worker muere antes del ACK, RabbitMQ re-entrega el mensaje a otro worker
+//
+// En producción aquí se llamaría a la API de la plataforma de apuestas:
+//   await bettingAPI.setMarketStatus(command.match_id, "SUSPENDED")
+//   await bettingAPI.setMarketStatus(command.match_id, "ACTIVE")
+// =============================================================================
 
+// amqplib: cliente de RabbitMQ para Node.js
 const amqplib = require("amqplib");
+
+// rabbitmqUrl: URL de conexión a RabbitMQ desde la configuración del servicio
 const { rabbitmqUrl } = require("./config");
 
-// Nombre de la cola de la que consume este worker.
-// Debe ser exactamente el mismo que usa el betting_suspension_service.
+// Nombre de la Work Queue de la que consume este worker.
+// DEBE coincidir exactamente con el nombre usado por betting_suspension_service
+// al publicar los comandos. Una discrepancia haría que los comandos nunca lleguen.
 const QUEUE_BETTING = "betting_commands";
 
-// ------------------------------------------------------------
-// start()
-// Conecta a RabbitMQ, declara la cola y arranca el consumer.
-// El proceso queda corriendo indefinidamente esperando mensajes.
-// ------------------------------------------------------------
+// =============================================================================
+// FUNCIÓN ASYNC: start()
+// =============================================================================
+// Conecta a RabbitMQ, declara la cola, configura el prefetch y arranca
+// el consumer. El proceso queda corriendo indefinidamente procesando comandos.
+//
+// ¿Por qué no hay reconexión automática aquí?
+// En este ejercicio académico, si RabbitMQ se cae el proceso termina y
+// Docker lo reinicia (según la restart policy del docker-compose.yml).
+// En producción se implementaría reconexión automática similar a los otros servicios.
+// =============================================================================
 async function start() {
-  // Conectamos a RabbitMQ y creamos el canal de comunicación
+  // Establecemos la conexión TCP con el broker de RabbitMQ
   const connection = await amqplib.connect(rabbitmqUrl);
+
+  // Creamos el canal de comunicación sobre la conexión
   const channel = await connection.createChannel();
 
-  // Declaramos la cola (idempotente): si ya existe, no falla.
-  // durable: true → la cola persiste aunque RabbitMQ se reinicie.
+  // Declaramos la cola (idempotente: no falla si ya existe).
+  // durable: true → la cola y sus mensajes persisten ante reinicios del broker.
   await channel.assertQueue(QUEUE_BETTING, { durable: true });
 
-  // prefetch(1): le dice a RabbitMQ que envíe solo 1 mensaje a la vez.
-  // El worker no recibirá el siguiente hasta hacer ACK del actual.
-  // Esto evita que un worker lento acumule muchos mensajes sin procesar.
+  // prefetch(1): le decimos a RabbitMQ que envíe MÁXIMO 1 mensaje a la vez.
+  // El worker no recibirá el siguiente mensaje hasta que haga ACK del actual.
+  //
+  // ¿Por qué es importante prefetch(1)?
+  // Sin prefetch, RabbitMQ podría enviar todos los mensajes pendientes al worker
+  // de golpe. Si el worker muere mientras procesa el mensaje 50 (de 100 enviados),
+  // los mensajes 51-100 que ya estaban "en vuelo" pero sin ACK también se perderían.
+  // Con prefetch(1), solo un mensaje está "en vuelo" a la vez, minimizando la pérdida.
   await channel.prefetch(1);
 
   console.log("[BETTING-WORKER] Esperando comandos en", QUEUE_BETTING);
 
-  // Iniciamos el consumer con reconocimiento manual (noAck: false)
+  // Iniciamos el consumer con reconocimiento MANUAL (noAck: false).
+  // Esto significa que RabbitMQ no eliminará el mensaje de la cola hasta
+  // que este worker llame explícitamente a channel.ack(msg).
   channel.consume(
     QUEUE_BETTING,
     (msg) => {
-      // Si msg es null, el consumer fue cancelado por el broker
+      // null indica que el consumer fue cancelado por el broker (ej: cola borrada)
       if (!msg) return;
 
-      // Extraemos el contenido del mensaje como string
+      // Extraemos el contenido del mensaje como string de texto
       const content = msg.content.toString();
       let command;
 
       try {
-        // Parseamos el JSON del comando
+        // Parseamos el JSON del comando de apuestas
         command = JSON.parse(content);
       } catch {
-        // Si el mensaje está malformado, lo rechazamos sin re-encolar
-        // (false, false = no re-encolar) para evitar un loop infinito
+        // Mensaje malformado (no es JSON válido): lo rechazamos sin re-encolar.
+        // Re-encolar un mensaje malformado causaría un loop infinito de errores
+        // porque ningún worker podría procesarlo.
         console.error("[BETTING-WORKER] Error parseando comando:", content);
-        channel.nack(msg, false, false);
+        channel.nack(msg, false, false); // false, false = no re-encolar
         return;
       }
 
-      // Elegimos el ícono según el tipo de comando para facilitar
-      // la lectura visual de los logs en la consola
+      // Elegimos el texto del ícono según el tipo de comando para que los logs
+      // sean más legibles visualmente: "PAUSA" para suspender, "REANUDAR" para activar.
       const icon = command.command === "SUSPEND_BETS" ? "PAUSA" : "REANUDAR";
 
-      // Registramos la acción. En producción aquí iría:
-      //   await bettingApi.setMarketStatus(command.match_id, command.command)
+      // Registramos la acción ejecutada.
+      // En producción esta línea sería reemplazada por una llamada real a la API:
+      //   const result = await bettingApi.setMarketStatus(command.match_id, command.command);
       console.log(
         `[BETTING-WORKER] [${icon}] Comando: ${command.command} | match_id: ${command.match_id} | motivo: ${command.reason}`
       );
 
-      // ACK manual: le confirmamos a RabbitMQ que el mensaje fue procesado.
-      // Solo después de este ACK el broker lo elimina de la cola.
-      // Si el worker muere antes del ACK, RabbitMQ re-encola el mensaje.
+      // ACK manual: le confirmamos a RabbitMQ que el mensaje fue procesado con éxito.
+      // SOLO DESPUÉS de este ACK, RabbitMQ elimina el mensaje de la cola definitivamente.
+      // Si el worker muriera antes de llegar aquí, RabbitMQ re-entregaría el mensaje
+      // a otro worker disponible (garantía de "at-least-once delivery").
       channel.ack(msg);
     },
-    { noAck: false } // Reconocimiento manual: esperamos el ACK explícito
+    { noAck: false } // Reconocimiento manual: NO confirmación automática al recibir
   );
 }
 
-// Iniciamos el servicio. Si falla al conectar, terminamos con código 1
-// para que Docker reinicie el contenedor automáticamente.
+// Iniciamos el servicio.
+// .catch() maneja errores de conexión al arrancar (ej: RabbitMQ no disponible).
+// process.exit(1) hace que Docker reinicie el contenedor automáticamente.
 start().catch((err) => {
   console.error("[BETTING-WORKER] Error:", err);
-  process.exit(1);
+  process.exit(1); // Código 1 = error → Docker intentará reiniciar según restart policy
 });

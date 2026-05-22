@@ -1,102 +1,144 @@
-/**
- * setup-exchanges.js — Declaración de la topología RabbitMQ
- * ==========================================================
- * Este script define TODA la infraestructura de mensajería
- * RabbitMQ que necesita el sistema. Se puede ejecutar una sola
- * vez antes de levantar los servicios, o al inicio de cada
- * servicio (es idempotente: RabbitMQ no falla si los exchanges
- * y colas ya existen con los mismos parámetros).
- *
- * Crea tres canales de comunicación:
- *   1. Topic Exchange  "live_updates"     → marcador al dashboard
- *   2. Fanout Exchange "live_alerts"      → alertas a notificaciones
- *   3. Work Queue      "betting_commands" → comandos de apuestas
- *
- * IDEMPOTENTE: se puede llamar N veces sin efectos secundarios.
- * Esto es importante en Docker donde varios contenedores pueden
- * intentar declarar los mismos recursos al arrancar.
- */
+// =============================================================================
+// dashboard_backend/setup-exchanges.js — Declaración de la topología RabbitMQ
+// =============================================================================
+// Este script define TODA la infraestructura de mensajería RabbitMQ que
+// necesita el sistema VAR Live Score Platform. Se puede ejecutar una sola
+// vez antes de levantar los servicios, o al inicio de cada servicio.
+//
+// ¿Por qué existe este archivo separado?
+// En sistemas distribuidos, la topología del broker de mensajería (exchanges,
+// colas, bindings) debe estar definida antes de que los servicios intenten
+// publicar o consumir mensajes. Este script centraliza esa configuración
+// para que sea fácil de entender y modificar sin tocar la lógica de negocio.
+//
+// ¿Qué es idempotente?
+// Idempotente significa que puedes ejecutar este script N veces y el resultado
+// siempre es el mismo: RabbitMQ no falla si el exchange o la cola ya existen
+// con los mismos parámetros. Es una propiedad importante en Docker donde
+// varios contenedores pueden intentar declarar los mismos recursos al arrancar.
+//
+// Topología que crea este script:
+//   1. Topic Exchange  "live_updates"     → routing key "score.*" → dashboard_q
+//   2. Fanout Exchange "live_alerts"      → todas las colas enlazadas → alerts_q
+//   3. Work Queue      "betting_commands" → (sin exchange, cola directa)
+//
+// Relación con los demás servicios:
+//   - match_state_service PUBLICA en "live_updates" y "live_alerts"
+//   - dashboard_backend   CONSUME de "dashboard_q"  (enlazada a "live_updates")
+//   - notification_backend CONSUME de "alerts_q"    (enlazada a "live_alerts")
+//   - betting_suspension_service PUBLICA en "betting_commands"
+//   - betting_worker      CONSUME de "betting_commands"
+// =============================================================================
 
-// amqplib es la librería cliente de RabbitMQ para Node.js
+// amqplib: librería cliente de RabbitMQ para Node.js
+// Implementa el protocolo AMQP 0-9-1 que usa RabbitMQ internamente
 const amqp = require('amqplib');
 
-// URL de conexión leída desde variable de entorno (o valor por defecto para local)
+// URL de conexión leída desde variable de entorno para flexibilidad entre
+// entornos (Docker usa "rabbitmq" como hostname; local usa "localhost")
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
 
+// =============================================================================
+// FUNCIÓN ASYNC: setupExchanges()
+// =============================================================================
+// Conecta a RabbitMQ y declara todos los exchanges, colas y bindings del sistema.
+// Si algo falla, registra el error y termina el proceso con código 1.
+// =============================================================================
 async function setupExchanges() {
-  let connection;
+  let connection; // Variable en scope exterior para poder cerrarla en el catch
   try {
     console.log('[SETUP] Conectando a RabbitMQ...');
+
+    // Establecemos la conexión TCP con el broker de RabbitMQ
     connection = await amqp.connect(RABBITMQ_URL);
 
     // Creamos un canal de comunicación sobre la conexión TCP.
-    // Un canal es un "tubo virtual" dentro de la conexión; es más
-    // eficiente crear varios canales que varias conexiones TCP.
+    // Un canal es un "tubo virtual" dentro de la misma conexión: es más eficiente
+    // crear múltiples canales que múltiples conexiones TCP completas.
     const channel = await connection.createChannel();
 
-    // ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     // 1. TOPIC EXCHANGE: "live_updates"
-    // ─────────────────────────────────────────────────────────
-    // Un Topic Exchange enruta mensajes a las colas según un
-    // patrón en la routing key. El dashboard usa el patrón
-    // "score.*" para recibir actualizaciones de CUALQUIER partido
-    // (score.123, score.456, etc.) sin cambiar su código.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Un Topic Exchange es como un "enrutador inteligente": recibe mensajes y
+    // los distribuye a las colas según si la routing key del mensaje coincide
+    // con el patrón de binding de cada cola.
     //
-    // durable: true → el exchange sobrevive reinicios del broker.
-    // ─────────────────────────────────────────────────────────
+    // Ejemplo de flujo:
+    //   match_state_service publica con key "score.match_123"
+    //   → el exchange compara con el patrón "score.*" de dashboard_q
+    //   → el patrón coincide (score.algo) → entrega a dashboard_q
+    //
+    // durable: true → el exchange sobrevive si RabbitMQ se reinicia,
+    //                  evitando que se pierda la configuración.
+    // ─────────────────────────────────────────────────────────────────────────
     await channel.assertExchange('live_updates', 'topic', {
-      durable: true,
+      durable: true, // El exchange persiste aunque el broker se reinicie
     });
     console.log('[SETUP] ✓ Exchange "live_updates" (topic) declarado');
 
-    // Cola del dashboard: recibe todos los mensajes cuya routing key
-    // empiece con "score." seguido de cualquier palabra (ej: score.123)
+    // Declaramos la cola del dashboard donde llegarán las actualizaciones de marcador.
+    // durable: true → la cola y sus mensajes persisten ante reinicios de RabbitMQ
     const { queue: dashboardQueue } = await channel.assertQueue('dashboard_q', {
-      durable: true, // La cola persiste aunque RabbitMQ se reinicie
+      durable: true,
     });
-    // Enlazamos la cola al exchange con el patrón "score.*"
-    // El * en RabbitMQ topic matches exactamente UNA palabra
+
+    // Enlazamos (binding) la cola al exchange con el patrón "score.*".
+    // El símbolo * en RabbitMQ Topic matching = exactamente UNA palabra.
+    // "score.*" coincide con: "score.123", "score.match_abc", etc.
+    // "score.#" coincidiría con: "score.123.extra.palabras" (# = cero o más palabras)
     await channel.bindQueue(dashboardQueue, 'live_updates', 'score.*');
     console.log('[SETUP] ✓ Cola "dashboard_q" enlazada con binding "score.*"');
 
-    // ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     // 2. FANOUT EXCHANGE: "live_alerts"
-    // ─────────────────────────────────────────────────────────
-    // Un Fanout Exchange envía CADA mensaje a TODAS las colas
-    // enlazadas, ignorando la routing key. Es perfecto para
-    // notificaciones que deben llegar a múltiples consumidores
-    // simultáneamente (dashboard, email, SMS, push, etc.)
-    // ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // Un Fanout Exchange es un "broadcast": envía CADA mensaje a TODAS las
+    // colas que estén enlazadas a él, sin importar la routing key.
+    // Es perfecto para notificaciones que deben llegar a múltiples sistemas:
+    //   - Sistema de email para enviar resúmenes de goles a suscriptores
+    //   - Sistema de push notifications para celulares
+    //   - Sistema de SMS para alertas premium
+    //   - En este ejercicio: el notification_backend que imprime en consola
+    // ─────────────────────────────────────────────────────────────────────────
     await channel.assertExchange('live_alerts', 'fanout', {
-      durable: true,
+      durable: true, // También persiste ante reinicios del broker
     });
     console.log('[SETUP] ✓ Exchange "live_alerts" (fanout) declarado');
 
-    // Cola de alertas enlazada al fanout sin routing key (no aplica en fanout)
+    // Cola de alertas que consume el notification_backend
     const { queue: alertsQueue } = await channel.assertQueue('alerts_q', {
       durable: true,
     });
-    // El segundo argumento '' es la routing key, ignorada por los fanout exchanges
+
+    // En un fanout exchange, la routing key del binding se ignora completamente.
+    // Pasamos '' (string vacío) por convención, pero cualquier valor serviría.
     await channel.bindQueue(alertsQueue, 'live_alerts', '');
     console.log('[SETUP] ✓ Cola "alerts_q" enlazada al fanout');
 
-    // ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
     // 3. WORK QUEUE: "betting_commands"
-    // ─────────────────────────────────────────────────────────
-    // Una Work Queue (cola de trabajo) implementa el patrón
-    // "competing consumers": si hay N workers escuchando, cada
-    // mensaje lo procesa exactamente UNO. RabbitMQ hace el
-    // balanceo de carga automáticamente entre los workers.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Una Work Queue (también llamada "Task Queue") implementa el patrón
+    // "Competing Consumers" o "Round Robin":
+    //   - Si hay 1 worker: procesa todos los mensajes secuencialmente
+    //   - Si hay N workers: cada mensaje va a exactamente UNO de los workers
+    //   - RabbitMQ hace el balanceo de carga automáticamente
     //
-    // No necesita exchange explícito: se publica directamente
-    // a la cola usando el exchange por defecto de RabbitMQ.
-    // ─────────────────────────────────────────────────────────
+    // ¿Por qué no usar un exchange? Las Work Queues usan el exchange DEFAULT
+    // de RabbitMQ (string vacío '') que enruta directamente a la cola por nombre.
+    // Es el patrón más simple y eficiente para colas de tareas.
+    //
+    // En este sistema:
+    //   - PUBLICADOR: betting_suspension_service (envía SUSPEND_BETS/RESUME_BETS)
+    //   - CONSUMIDOR: betting_worker (ejecuta la acción de suspender/reanudar)
+    // ─────────────────────────────────────────────────────────────────────────
     await channel.assertQueue('betting_commands', {
-      durable: true, // Los mensajes no se pierden si el broker se reinicia
+      durable: true, // Los comandos no se pierden si el broker se reinicia
     });
     console.log('[SETUP] ✓ Work Queue "betting_commands" declarada');
 
-    // Resumen de la topología creada para verificación visual
+    // Imprimimos un resumen de toda la topología creada para verificación visual
     console.log('\n[SETUP] ════════════════════════════════════════');
     console.log('[SETUP]  Topologia RabbitMQ lista:');
     console.log('[SETUP]  Exchange  live_updates  (topic)  → dashboard_q [score.*]');
@@ -108,19 +150,22 @@ async function setupExchanges() {
     console.log('[SETUP] ════════════════════════════════════════\n');
 
     // Cerramos el canal y la conexión limpiamente.
-    // Este script termina su trabajo aquí: solo declara la topología.
+    // Este script solo declara la topología y termina: los servicios
+    // se encargan de sus propias conexiones en tiempo de ejecución.
     await channel.close();
     await connection.close();
     console.log('[SETUP] Conexion cerrada limpiamente. Setup completo.');
 
   } catch (error) {
     console.error('[SETUP] ERROR:', error.message);
-    // Cerramos la conexión aunque haya error para no dejarla colgada
+    // Cerramos la conexión aunque haya error para no dejar recursos colgados
     if (connection) await connection.close().catch(() => {});
-    // Terminamos con código de error para que Docker lo detecte
+    // Terminamos con código 1 para que Docker detecte el fallo y pueda reintentar
     process.exit(1);
   }
 }
 
-// Ejecutamos el setup inmediatamente al correr el script
+// Ejecutamos el setup inmediatamente cuando se corre este script.
+// Node.js ejecuta el módulo de arriba a abajo, y al llegar aquí
+// lanza setupExchanges() y el proceso termina cuando la Promise resuelve.
 setupExchanges();

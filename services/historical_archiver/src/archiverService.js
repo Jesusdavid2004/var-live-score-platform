@@ -1,80 +1,109 @@
-// ============================================================
-// archiverService.js — Lógica principal del archivador histórico
-// ============================================================
-// Este servicio actúa como el "registrador" del sistema: consume
-// TODOS los eventos que llegan al topic de Kafka y los persiste
-// (en este caso, en consola; en producción sería una base de datos
-// como PostgreSQL, MongoDB o S3).
+// =============================================================================
+// historical_archiver/src/archiverService.js — Lógica del archivador histórico
+// =============================================================================
+// Este módulo contiene toda la lógica del historical_archiver: conectarse a
+// Kafka, suscribirse al topic de eventos y persistir cada mensaje recibido.
 //
-// ¿Por qué existe un archivador separado?
-// En sistemas distribuidos es una buena práctica tener un servicio
-// dedicado a persistir todos los eventos. Esto permite:
-//   - Auditoría: saber exactamente qué pasó y cuándo
-//   - Replay: reprocesar eventos históricos si cambia la lógica
-//   - Debugging: comparar lo que se publicó vs lo que se procesó
-// ============================================================
+// ¿Cuál es el rol del historical_archiver en la arquitectura?
+// Es el "notario" del sistema: registra TODOS los eventos que ocurren en el
+// partido con sus metadatos completos de Kafka (topic, partición, offset, key).
+// Esto es fundamental para:
+//
+//   1. AUDITORÍA: verificar exactamente qué eventos se publicaron y cuándo.
+//      Si hay un error en el marcador, se puede revisar el historial para
+//      encontrar el evento que causó el problema.
+//
+//   2. REPLAY: si se agrega una nueva regla de negocio (ej: nuevo tipo de apuesta),
+//      se pueden reprocesar todos los eventos históricos para recalcular el estado.
+//      Kafka permite leer el topic desde el principio (fromBeginning: true).
+//
+//   3. ANÁLISIS: contar goles por equipo, frecuencia de revisiones VAR, etc.
+//      En producción, los eventos archivados se consultarían con SQL o un motor
+//      de análisis como Apache Spark o AWS Athena.
+//
+// Diferencia clave con match_state_service:
+//   - match_state_service: procesa eventos y MODIFICA el estado (marcador)
+//   - historical_archiver: solo REGISTRA eventos sin modificar ningún estado
+// =============================================================================
 
-// Importamos el consumer ya instanciado desde kafka.js
+// consumer: instancia singleton del consumer de KafkaJS para este servicio
 const { consumer } = require("./kafka");
 
-// Importamos el nombre del topic desde la configuración
+// kafkaTopic: nombre del topic de Kafka del que se consumen los eventos
 const { kafkaTopic } = require("./config");
 
-// ------------------------------------------------------------
-// startArchiver()
-// Conecta el consumer a Kafka, se suscribe al topic y empieza
-// a escuchar mensajes indefinidamente (el proceso no termina).
+// =============================================================================
+// FUNCIÓN ASYNC: startArchiver()
+// =============================================================================
+// Conecta el consumer a Kafka y arranca el loop de archivado indefinido.
+// Cada mensaje que llega al topic se registra con sus metadatos completos.
 //
-// fromBeginning: true → al primera vez que arranca, lee todos
-// los mensajes desde el inicio del topic, no solo los nuevos.
-// Esto garantiza que el archivador tenga un historial completo
-// aunque haya arrancado tarde.
-// ------------------------------------------------------------
+// ¿Por qué fromBeginning: true?
+// Al arrancar por primera vez, queremos archivar TODOS los eventos históricos
+// del topic, no solo los nuevos. Si el archiver se reinicia (ej: por un error),
+// Kafka le entregará los eventos desde el último offset procesado, no desde 0,
+// gracias al Consumer Group "historical-archiver-group" que guarda el progreso.
+// =============================================================================
 async function startArchiver() {
-  // Establece la conexión con el broker de Kafka
+  // Establecemos la conexión TCP con el broker de Kafka.
+  // Si Kafka no está disponible (ej: Docker aún iniciando), lanza excepción
+  // que sube a bootstrap() en index.js y termina el proceso con código 1.
   await consumer.connect();
 
-  // Se suscribe al topic. fromBeginning: true asegura que el archivador
-  // procese todos los eventos desde el offset 0 la primera vez.
+  // Nos suscribimos al topic de eventos del partido.
+  // fromBeginning: true → al primera conexión, leer desde el mensaje más antiguo.
+  // En reconexiones posteriores, Kafka entrega desde el último offset confirmado.
   await consumer.subscribe({ topic: kafkaTopic, fromBeginning: true });
 
   console.log("[ARCHIVER] Escuchando eventos...");
 
-  // Inicia el loop de consumo. eachMessage se llama una vez por
-  // cada mensaje que Kafka entrega al consumer.
+  // Iniciamos el loop de consumo. KafkaJS llama a eachMessage() por cada
+  // mensaje nuevo que llega. El proceso no termina: espera mensajes indefinidamente.
   await consumer.run({
     eachMessage: async ({ topic, partition, message }) => {
-      // Extraemos la key del mensaje (es el match_id serializado como Buffer)
-      // Si no tiene key, usamos null
+      // ── Extraemos los metadatos del mensaje de Kafka ──────────────────────
+      // Estos metadatos son únicos de Kafka y no forman parte del payload del evento.
+      // Son útiles para debugging, auditoría y para saber la posición en el log.
+
+      // message.key: clave del mensaje (normalmente el match_id serializado).
+      // El operador ?. evita error si key es null (mensajes sin key definida).
       const key = message.key?.toString() || null;
 
-      // Extraemos el valor del mensaje como string JSON
+      // message.value: el payload del evento en formato Buffer binario.
+      // Lo convertimos a string JSON para parsearlo.
       const rawValue = message.value?.toString() || "{}";
 
-      // Parseamos el JSON; si viene malformado, lo registramos y seguimos
+      // Parseamos el JSON del payload del evento
       let payload;
       try {
-        payload = JSON.parse(rawValue);
+        payload = JSON.parse(rawValue); // String JSON → objeto JavaScript
       } catch (error) {
+        // Si el mensaje no es JSON válido (error del productor), lo registramos
+        // pero NO crasheamos: continuamos con el siguiente mensaje.
         console.error("[ARCHIVER] Error parseando mensaje:", rawValue);
-        return; // Saltamos este mensaje sin crashear el servicio
+        return; // Saltamos este mensaje específico
       }
 
-      // Registramos el evento con todos sus metadatos de Kafka:
-      //   - topic: el topic del que vino (útil si consume varios)
-      //   - partition: en qué partición estaba el mensaje
-      //   - key: el match_id (sirve para filtrar por partido después)
-      //   - payload: el contenido del evento
-      // En producción aquí iría: db.insert(payload) o s3.upload(payload)
+      // ── Archivamos el evento con todos sus metadatos ──────────────────────
+      // En producción, esta línea sería reemplazada por:
+      //   await db.insert('events', { topic, partition, key, payload, archivedAt: new Date() })
+      // o:
+      //   await s3.upload({ Bucket: 'match-events', Key: `${key}/${payload.event_id}.json`, Body: rawValue })
+      //
+      // Los campos registrados:
+      //   topic:     el topic de Kafka del que vino (útil si el archiver consume múltiples topics)
+      //   partition: en qué partición estaba almacenado el mensaje (0 en nuestra config)
+      //   key:       la clave del mensaje = match_id (para filtrar eventos por partido)
+      //   payload:   el objeto del evento con event_type, home, away, team, timestamp, etc.
       console.log("[ARCHIVER] Archivando evento:", {
-        topic,
-        partition,
-        key,
-        payload,
+        topic,     // Nombre del topic: "match_events"
+        partition, // Número de partición: 0 (solo hay una en nuestra configuración)
+        key,       // match_id del partido: "123"
+        payload,   // El evento completo: { match_id, event_type, event_id, timestamp, ... }
       });
     },
   });
 }
 
-// Exportamos la función para que index.js la llame al arrancar
+// Exportamos startArchiver para que index.js la llame al arrancar el servicio
 module.exports = { startArchiver };
