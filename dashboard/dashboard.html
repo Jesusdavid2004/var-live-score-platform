@@ -186,13 +186,26 @@
       cursor: pointer;
       transition: background 0.2s, color 0.2s, border-color 0.2s;
     }
-    .btn-reiniciar:hover {
+    .btn-reiniciar:hover:not(:disabled) {
       background: #263238;
       color: #e8eaf6;
       border-color: #546e7a;
     }
-    .btn-reiniciar:active {
+    .btn-reiniciar:active:not(:disabled) {
       background: #37474f;
+    }
+    .btn-reiniciar:disabled {
+      background: #0d1220;
+      color: #37474f;
+      border-color: #1e2a45;
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+    .btn-hint {
+      margin-top: 6px;
+      font-size: 0.68rem;
+      color: #37474f;
+      letter-spacing: 0.5px;
     }
 
     /* ── Indicador de conexion ───────────────────────────── */
@@ -218,7 +231,8 @@
     }
     .conn-dot.live         { background: #66bb6a; box-shadow: 0 0 6px #66bb6a88; }
     .conn-dot.finished     { background: #ef5350; }
-    .conn-dot.connecting   { background: #f57c00; animation: pulse 1s infinite; }
+    .conn-dot.connecting,
+    .conn-dot.restarting   { background: #f57c00; animation: pulse 1s infinite; }
     .conn-dot.disconnected { background: #546e7a; }
   </style>
 </head>
@@ -269,9 +283,10 @@
   </div>
 
   <!-- Boton de reinicio del partido -->
-  <button class="btn-reiniciar" id="btnReiniciar" onclick="reiniciarPartido()">
+  <button class="btn-reiniciar" id="btnReiniciar" onclick="reiniciarPartido()" disabled>
     🔄 Reiniciar Partido
   </button>
+  <p class="btn-hint" id="btnHint">Disponible cuando finalice el partido</p>
 
   <script>
     // ── Config ────────────────────────────────────────────────────────────────
@@ -284,8 +299,10 @@
     const varBanner = document.getElementById('varBanner');
     const matchCard = document.getElementById('matchCard');
     const logList   = document.getElementById('logList');
-    const connDot   = document.getElementById('connDot');
-    const connLabel = document.getElementById('connLabel');
+    const connDot      = document.getElementById('connDot');
+    const connLabel    = document.getElementById('connLabel');
+    const btnReiniciar = document.getElementById('btnReiniciar');
+    const btnHint      = document.getElementById('btnHint');
 
     // ── Estado local ──────────────────────────────────────────────────────────
     let ws;
@@ -392,11 +409,13 @@
       // 4. Agrega al log
       agregarLog(datos);
 
-      // 5. Actualiza el indicador de estado del partido
+      // 5. Actualiza indicador y estado del botón según el evento
       if (tipo === 'MATCH_END') {
         setEstadoConexion('finished');
+        setBotonHabilitado(true);
       } else {
         setEstadoConexion('live');
+        if (tipo === 'KICKOFF') setBotonHabilitado(false);
       }
     }
 
@@ -435,30 +454,53 @@
       connDot.className = `conn-dot ${estado}`;
       connLabel.textContent = {
         connecting:    'Conectando...',
+        restarting:    'Reiniciando...',
         live:          'En vivo',
         finished:      'Finalizado',
         disconnected:  'Sin conexión',
       }[estado] || estado;
     }
 
+    function setBotonHabilitado(habilitado) {
+      btnReiniciar.disabled = !habilitado;
+      btnHint.style.visibility = habilitado ? 'hidden' : 'visible';
+    }
+
     // ── Reiniciar partido ─────────────────────────────────────────────────────
-    function reiniciarPartido() {
-      // Solo limpieza visual — el live_feed_producer corre en loop automatico
-      // y enviara los eventos del nuevo partido por si solo
+    async function reiniciarPartido() {
+      // 1. Indicador naranja "Reiniciando..." y deshabilitar botón de inmediato
+      setEstadoConexion('restarting');
+      setBotonHabilitado(false);
 
-      // Limpiar marcador
-      scoreHome.textContent = '-';
-      scoreAway.textContent = '-';
+      // 2. Limpiar marcador a 0-0
+      scoreHome.textContent = '0';
+      scoreAway.textContent = '0';
 
-      // Limpiar el log de eventos
+      // 3. Limpiar el log y agregar entrada de reinicio
       logList.innerHTML = '';
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <span class="log-icon">🔄</span>
+        <span class="log-time">${new Date().toLocaleTimeString('es-CO', { hour12: false })}</span>
+        <span class="log-text">Reiniciando partido...</span>
+      `;
+      logList.insertBefore(li, logList.firstChild);
 
-      // Volver al estado inicial
+      // 4. Restablecer estado visual del partido
       lastEvent.textContent = 'Esperando inicio del partido...';
       lastEvent.className = 'last-event';
       varBanner.classList.remove('visible');
       matchCard.classList.remove('var-active');
-      setEstadoConexion('connecting');
+
+      // 5. Llamar al backend y al recibir ok → pasar a "En vivo"
+      try {
+        const resp = await fetch('/reiniciar', { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) setEstadoConexion('live');
+      } catch (e) {
+        console.error('[RESET] Error al llamar /reiniciar:', e);
+        setEstadoConexion('disconnected');
+      }
     }
 
     // ── Arranque ──────────────────────────────────────────────────────────────
