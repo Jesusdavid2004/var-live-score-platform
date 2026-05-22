@@ -433,28 +433,22 @@
     }
 
     // ── Reiniciar partido ─────────────────────────────────────────────────────
-    async function reiniciarPartido() {
-      // 1. Limpiar marcador a 0-0 en pantalla
-      scoreHome.textContent = '0';
-      scoreAway.textContent = '0';
+    function reiniciarPartido() {
+      // Solo limpieza visual — el live_feed_producer corre en loop automatico
+      // y enviara los eventos del nuevo partido por si solo
 
-      // 2. Limpiar el log de eventos
+      // Limpiar marcador
+      scoreHome.textContent = '-';
+      scoreAway.textContent = '-';
+
+      // Limpiar el log de eventos
       logList.innerHTML = '';
 
-      // 3. Volver al estado inicial
+      // Volver al estado inicial
       lastEvent.textContent = 'Esperando inicio del partido...';
       lastEvent.className = 'last-event';
       varBanner.classList.remove('visible');
       matchCard.classList.remove('var-active');
-
-      // 4. Llamar al endpoint del backend para reiniciar la simulacion
-      try {
-        const resp = await fetch('/reiniciar', { method: 'POST' });
-        const data = await resp.json();
-        console.log('[RESET] Respuesta del backend:', data);
-      } catch (e) {
-        console.error('[RESET] Error al llamar /reiniciar:', e);
-      }
     }
 
     // ── Arranque ──────────────────────────────────────────────────────────────

@@ -192,10 +192,11 @@ async function conectarRabbitMQ() {
 // ── Endpoint POST /reiniciar ─────────────────────────────────────────────────
 /**
  * POST /reiniciar
- * Reinicia la simulación del partido:
+ * Resetea el estado del dashboard y notifica a los clientes WebSocket.
+ * El live_feed_producer corre en bucle automático, por lo que no hace
+ * falta reiniciarlo; este endpoint solo limpia el estado del servidor.
  *   1. Resetea ultimoEstado a null
- *   2. Hace broadcast del KICKOFF 0-0 a todos los clientes WebSocket
- *   3. Reinicia el contenedor live_feed_producer via docker restart
+ *   2. Hace broadcast del reset a todos los clientes WebSocket
  */
 app.post('/reiniciar', (req, res) => {
   console.log('[HTTP] POST /reiniciar recibido');
@@ -203,24 +204,8 @@ app.post('/reiniciar', (req, res) => {
   // 1. Resetear el estado en memoria
   ultimoEstado = null;
 
-  // 2. Broadcast del KICKOFF 0-0 a todos los clientes WebSocket conectados
-  const mensajeReset = {
-    event_type: 'KICKOFF',
-    home: 0,
-    away: 0,
-    match_id: '123',
-    timestamp: new Date().toISOString(),
-  };
-  broadcast(mensajeReset);
-
-  // 3. Reiniciar el contenedor live_feed_producer para que vuelva a ejecutarse
-  require('child_process').exec('docker restart live_feed_producer', (err, stdout, stderr) => {
-    if (err) {
-      console.error('[HTTP] Error reiniciando live_feed_producer:', err.message);
-    } else {
-      console.log('[HTTP] live_feed_producer reiniciado:', stdout.trim());
-    }
-  });
+  // 2. Broadcast a todos los clientes WebSocket para sincronizar pantallas
+  broadcast({ event_type: 'RESET' });
 
   res.json({ ok: true });
 });
