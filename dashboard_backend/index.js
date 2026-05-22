@@ -194,16 +194,16 @@ async function conectarRabbitMQ() {
  * POST /reiniciar
  * Reinicia la simulación del partido:
  *   1. Resetea ultimoEstado a null
- *   2. Publica un KICKOFF 0-0 al exchange live_updates (routing key score.123)
- *      para que el live_feed_producer detecte el reinicio
- *   3. Hace broadcast del reset a todos los clientes WebSocket conectados
+ *   2. Hace broadcast del KICKOFF 0-0 a todos los clientes WebSocket
+ *   3. Reinicia el contenedor live_feed_producer via docker restart
  */
-app.post('/reiniciar', async (req, res) => {
+app.post('/reiniciar', (req, res) => {
   console.log('[HTTP] POST /reiniciar recibido');
 
   // 1. Resetear el estado en memoria
   ultimoEstado = null;
 
+  // 2. Broadcast del KICKOFF 0-0 a todos los clientes WebSocket conectados
   const mensajeReset = {
     event_type: 'KICKOFF',
     home: 0,
@@ -211,29 +211,18 @@ app.post('/reiniciar', async (req, res) => {
     match_id: '123',
     timestamp: new Date().toISOString(),
   };
-
-  // 2. Publicar al exchange live_updates para notificar al live_feed_producer
-  if (rabbitChannel) {
-    try {
-      await rabbitChannel.assertExchange('live_updates', 'topic', { durable: true });
-      rabbitChannel.publish(
-        'live_updates',
-        'score.123',
-        Buffer.from(JSON.stringify(mensajeReset)),
-        { persistent: true }
-      );
-      console.log('[HTTP] Mensaje KICKOFF 0-0 publicado a live_updates → score.123');
-    } catch (err) {
-      console.error('[HTTP] Error publicando a RabbitMQ:', err.message);
-    }
-  } else {
-    console.warn('[HTTP] rabbitChannel no disponible aún; solo se hace broadcast WS');
-  }
-
-  // 3. Broadcast WebSocket a todos los clientes conectados
   broadcast(mensajeReset);
 
-  res.json({ ok: true, mensaje: 'Partido reiniciado' });
+  // 3. Reiniciar el contenedor live_feed_producer para que vuelva a ejecutarse
+  require('child_process').exec('docker restart live_feed_producer', (err, stdout, stderr) => {
+    if (err) {
+      console.error('[HTTP] Error reiniciando live_feed_producer:', err.message);
+    } else {
+      console.log('[HTTP] live_feed_producer reiniciado:', stdout.trim());
+    }
+  });
+
+  res.json({ ok: true });
 });
 
 // ── Arranque del servidor ────────────────────────────────────────────────────
