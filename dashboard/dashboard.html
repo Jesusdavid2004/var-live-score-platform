@@ -172,6 +172,29 @@
     .log-list .log-icon { font-size: 1rem; }
     .log-list .log-text { color: #90a4ae; }
 
+    /* ── Boton Reiniciar Partido ─────────────────────────── */
+    .btn-reiniciar {
+      margin-top: 20px;
+      padding: 10px 24px;
+      background: #1e2a45;
+      color: #90a4ae;
+      border: 1px solid #37474f;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      letter-spacing: 1px;
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s, border-color 0.2s;
+    }
+    .btn-reiniciar:hover {
+      background: #263238;
+      color: #e8eaf6;
+      border-color: #546e7a;
+    }
+    .btn-reiniciar:active {
+      background: #37474f;
+    }
+
     /* ── Indicador de conexion ───────────────────────────── */
     .conn-status {
       position: fixed;
@@ -243,6 +266,11 @@
     <h2>⚡ Eventos en tiempo real</h2>
     <ul class="log-list" id="logList"></ul>
   </div>
+
+  <!-- Boton de reinicio del partido -->
+  <button class="btn-reiniciar" id="btnReiniciar" onclick="reiniciarPartido()">
+    🔄 Reiniciar Partido
+  </button>
 
   <script>
     // ── Config ────────────────────────────────────────────────────────────────
@@ -402,6 +430,31 @@
         connected:     'En vivo',
         disconnected:  'Reconectando...',
       }[estado];
+    }
+
+    // ── Reiniciar partido ─────────────────────────────────────────────────────
+    async function reiniciarPartido() {
+      // 1. Limpiar marcador a 0-0 en pantalla
+      scoreHome.textContent = '0';
+      scoreAway.textContent = '0';
+
+      // 2. Limpiar el log de eventos
+      logList.innerHTML = '';
+
+      // 3. Volver al estado inicial
+      lastEvent.textContent = 'Esperando inicio del partido...';
+      lastEvent.className = 'last-event';
+      varBanner.classList.remove('visible');
+      matchCard.classList.remove('var-active');
+
+      // 4. Llamar al endpoint del backend para reiniciar la simulacion
+      try {
+        const resp = await fetch('/reiniciar', { method: 'POST' });
+        const data = await resp.json();
+        console.log('[RESET] Respuesta del backend:', data);
+      } catch (e) {
+        console.error('[RESET] Error al llamar /reiniciar:', e);
+      }
     }
 
     // ── Arranque ──────────────────────────────────────────────────────────────

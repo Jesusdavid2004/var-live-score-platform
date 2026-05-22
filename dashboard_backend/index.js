@@ -36,6 +36,8 @@ const DASHBOARD_PORT = process.env.DASHBOARD_PORT || 3003;
 // ── Configuración del servidor HTTP + WebSocket ──────────────────────────────
 // Express maneja las peticiones HTTP (GET /dashboard.html)
 const app = express();
+// Parseamos el body JSON de las peticiones HTTP entrantes (necesario para POST /reiniciar)
+app.use(express.json());
 // Creamos el servidor HTTP sobre Express. Necesitamos el objeto "server"
 // explícito porque el WebSocket se monta sobre él (comparten el puerto).
 const server = http.createServer(app);
@@ -53,6 +55,9 @@ app.use(express.static(path.join(__dirname, '..', 'dashboard')));
 // navegador que se conecte tarde (por ejemplo, después del kickoff).
 // Sin esto, el dashboard estaría vacío hasta el próximo evento.
 let ultimoEstado = null;
+
+// Canal RabbitMQ compartido para que el endpoint POST /reiniciar pueda publicar
+let rabbitChannel = null;
 
 // ── Gestión de clientes WebSocket ────────────────────────────────────────────
 // Este evento se dispara cada vez que un navegador abre una conexión WebSocket
@@ -129,6 +134,9 @@ async function conectarRabbitMQ() {
     const { queue } = await channel.assertQueue('dashboard_q', { durable: true });
     await channel.bindQueue(queue, 'live_updates', 'score.*');
 
+    // Guardamos el canal en la variable compartida para que POST /reiniciar lo use
+    rabbitChannel = channel;
+
     console.log('[RABBIT] ✓ Suscrito a live_updates → dashboard_q [score.*]');
     console.log('[RABBIT] Esperando mensajes de marcador...\n');
 
@@ -180,6 +188,53 @@ async function conectarRabbitMQ() {
     setTimeout(conectarRabbitMQ, 5000);
   }
 }
+
+// ── Endpoint POST /reiniciar ─────────────────────────────────────────────────
+/**
+ * POST /reiniciar
+ * Reinicia la simulación del partido:
+ *   1. Resetea ultimoEstado a null
+ *   2. Publica un KICKOFF 0-0 al exchange live_updates (routing key score.123)
+ *      para que el live_feed_producer detecte el reinicio
+ *   3. Hace broadcast del reset a todos los clientes WebSocket conectados
+ */
+app.post('/reiniciar', async (req, res) => {
+  console.log('[HTTP] POST /reiniciar recibido');
+
+  // 1. Resetear el estado en memoria
+  ultimoEstado = null;
+
+  const mensajeReset = {
+    event_type: 'KICKOFF',
+    home: 0,
+    away: 0,
+    match_id: '123',
+    timestamp: new Date().toISOString(),
+  };
+
+  // 2. Publicar al exchange live_updates para notificar al live_feed_producer
+  if (rabbitChannel) {
+    try {
+      await rabbitChannel.assertExchange('live_updates', 'topic', { durable: true });
+      rabbitChannel.publish(
+        'live_updates',
+        'score.123',
+        Buffer.from(JSON.stringify(mensajeReset)),
+        { persistent: true }
+      );
+      console.log('[HTTP] Mensaje KICKOFF 0-0 publicado a live_updates → score.123');
+    } catch (err) {
+      console.error('[HTTP] Error publicando a RabbitMQ:', err.message);
+    }
+  } else {
+    console.warn('[HTTP] rabbitChannel no disponible aún; solo se hace broadcast WS');
+  }
+
+  // 3. Broadcast WebSocket a todos los clientes conectados
+  broadcast(mensajeReset);
+
+  res.json({ ok: true, mensaje: 'Partido reiniciado' });
+});
 
 // ── Arranque del servidor ────────────────────────────────────────────────────
 // Iniciamos el servidor HTTP+WebSocket en el puerto configurado.
