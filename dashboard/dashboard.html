@@ -216,9 +216,10 @@
       background: #37474f;
       transition: background 0.3s;
     }
-    .conn-dot.connected    { background: #66bb6a; box-shadow: 0 0 6px #66bb6a88; }
-    .conn-dot.disconnected { background: #ef5350; }
+    .conn-dot.live         { background: #66bb6a; box-shadow: 0 0 6px #66bb6a88; }
+    .conn-dot.finished     { background: #ef5350; }
     .conn-dot.connecting   { background: #f57c00; animation: pulse 1s infinite; }
+    .conn-dot.disconnected { background: #546e7a; }
   </style>
 </head>
 <body>
@@ -390,6 +391,13 @@
 
       // 4. Agrega al log
       agregarLog(datos);
+
+      // 5. Actualiza el indicador de estado del partido
+      if (tipo === 'MATCH_END') {
+        setEstadoConexion('finished');
+      } else {
+        setEstadoConexion('live');
+      }
     }
 
     // ── Conexion WebSocket con reconexion automatica ──────────────────────────
@@ -398,7 +406,7 @@
       ws = new WebSocket(WS_URL);
 
       ws.onopen = () => {
-        setEstadoConexion('connected');
+        setEstadoConexion('connecting');
         console.log('[WS] Conectado al dashboard_backend');
       };
 
@@ -427,9 +435,10 @@
       connDot.className = `conn-dot ${estado}`;
       connLabel.textContent = {
         connecting:    'Conectando...',
-        connected:     'En vivo',
-        disconnected:  'Reconectando...',
-      }[estado];
+        live:          'En vivo',
+        finished:      'Finalizado',
+        disconnected:  'Sin conexión',
+      }[estado] || estado;
     }
 
     // ── Reiniciar partido ─────────────────────────────────────────────────────
@@ -449,6 +458,7 @@
       lastEvent.className = 'last-event';
       varBanner.classList.remove('visible');
       matchCard.classList.remove('var-active');
+      setEstadoConexion('connecting');
     }
 
     // ── Arranque ──────────────────────────────────────────────────────────────

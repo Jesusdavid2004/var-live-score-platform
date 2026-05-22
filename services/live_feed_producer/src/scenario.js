@@ -49,26 +49,28 @@ const {
 // ------------------------------------------------------------
 async function runScenario() {
   // Paso 1: Inicio del partido
-  // Publicamos KICKOFF y esperamos 3 segundos antes del primer gol
   const kickoffEvent = kickoff(matchId);
   await publishEvent(kickoffEvent);
-  await sleep(3000); // 3 segundos entre el inicio y el primer gol
+  await sleep(5000); // 5 segundos antes de la primera falta
 
-  // Paso 2: Gol del equipo local
-  // Guardamos el evento para poder referenciar su ID en el VAR_CHECK
+  // Paso 2: Falta del equipo visitante (antes del gol)
+  const foulEvent = foul(matchId, "away");
+  await publishEvent(foulEvent);
+  await sleep(5000); // 5 segundos antes del gol
+
+  // Paso 3: Gol del equipo local
+  // Guardamos el evento para referenciar su ID en el VAR_CHECK
   const goalEvent = goal(matchId, "home");
   await publishEvent(goalEvent);
-  await sleep(2000); // 2 segundos antes de que el VAR intervenga
+  await sleep(5000); // 5 segundos antes de que el VAR intervenga
 
-  // Paso 3: Revisión VAR del gol recién marcado
+  // Paso 4: Revisión VAR del gol recién marcado
   // related_event_id apunta al gol para que los consumidores sepan
   // cuál gol está siendo revisado en este momento
   const varEvent = varCheck(matchId, "home", goalEvent.event_id);
   await publishEvent(varEvent);
 
-  // Paso 4: Espera mientras el VAR revisa (configurable en .env)
-  // Esto simula los segundos de tensión mientras el árbitro revisa
-  // las imágenes de video. Por defecto son 20 segundos.
+  // Espera mientras el VAR revisa (configurable en .env, por defecto 20s)
   console.log(`[PRODUCER] Esperando ${varDelayMs}ms para resolver VAR...`);
   await sleep(varDelayMs);
 
@@ -77,14 +79,9 @@ async function runScenario() {
   // el match_state_service pueda revertir exactamente ese gol
   const annulledEvent = goalAnnulled(matchId, goalEvent.event_id);
   await publishEvent(annulledEvent);
-  await sleep(3000); // 3 segundos antes de la siguiente jugada
+  await sleep(5000); // 5 segundos hasta el pitido final
 
-  // Paso 6: Falta del equipo visitante (evento informativo)
-  const foulEvent = foul(matchId, "away");
-  await publishEvent(foulEvent);
-  await sleep(3000); // 3 segundos hasta el pitido final
-
-  // Paso 7: Fin del partido
+  // Paso 6: Fin del partido
   // Señal para que todos los consumidores sepan que no habrá más eventos
   const endEvent = matchEnd(matchId);
   await publishEvent(endEvent);
